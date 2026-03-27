@@ -17,6 +17,8 @@
 
 pub mod ema_cross;
 pub mod grid_mm;
+pub mod uc_dual_leg_bollinger_hft;
 
 pub use ema_cross::EmaCross;
 pub use grid_mm::{GridMarketMaker, GridMarketMakerConfig};
+pub use uc_dual_leg_bollinger_hft::{UcDualLegBollingerHft, UcDualLegBollingerHftConfig};

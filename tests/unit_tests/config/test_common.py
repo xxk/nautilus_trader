@@ -78,7 +78,7 @@ def test_config_id() -> None:
     config = DatabaseConfig()
 
     # Act, Assert
-    assert config.id == "c3fad60cbcd4eb9d9f19081f6f342f04a77f1328e9487f11696f9abc119ff0e1"
+    assert config.id == "73a7170e54708c1e1e68a32bcffe22ca0b816668167aef2cca3c2b9030f2f86d"
 
 
 def test_fully_qualified_name() -> None:
@@ -115,6 +115,7 @@ def test_dict() -> None:
         "port": None,
         "username": None,
         "password": None,
+        "database": None,
         "ssl": False,
         "timeout": 20,
     }
@@ -127,7 +128,7 @@ def test_json() -> None:
     # Act, Assert
     assert (
         config.json()
-        == b'{"type":"redis","host":null,"port":null,"username":null,"password":null,"ssl":false,"timeout":20}'
+        == b'{"type":"redis","host":null,"port":null,"username":null,"password":null,"database":null,"ssl":false,"timeout":20}'
     )
 
 

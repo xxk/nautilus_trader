@@ -107,3 +107,9 @@ name = "node-ema-cross"
 path = "examples/node_ema_cross.rs"
 required-features = ["examples", "streaming"]
 doc = false
+
+[[example]]
+name = "engine-uc-dual-leg-bollinger-hft"
+path = "examples/engine_uc_dual_leg_bollinger_hft.rs"
+required-features = ["examples"]
+doc = false

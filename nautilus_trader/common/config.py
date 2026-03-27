@@ -308,7 +308,7 @@ class DatabaseConfig(NautilusConfig, frozen=True):
 
     Parameters
     ----------
-    type : str, {'redis'}, default 'redis'
+    type : str, {'redis', 'postgres'}, default 'redis'
         The database type.
     host : str, optional
         The database host address. If `None` then should use the typical default.
@@ -323,10 +323,13 @@ class DatabaseConfig(NautilusConfig, frozen=True):
         If socket should use an SSL (TLS encryption) enabled connection.
     timeout : int, default 20
         The timeout (seconds) to wait for a new connection.
+    database : str, optional
+        The database name. Required when `type` is 'postgres'. Ignored for 'redis'.
 
     Notes
     -----
     If `type` is 'redis' then requires Redis version 6.2 or higher for correct operation (required for streams functionality).
+    If `type` is 'postgres' then `database` must be provided either here or via the ``POSTGRES_DATABASE`` environment variable.
 
     """
 
@@ -337,6 +340,7 @@ class DatabaseConfig(NautilusConfig, frozen=True):
     password: str | None = None
     ssl: bool = False
     timeout: int | None = 20
+    database: str | None = None
 
     def __repr__(self) -> str:
         redacted_password = "None"

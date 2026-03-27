@@ -27,6 +27,7 @@ from pathlib import Path
 
 import msgspec
 
+from nautilus_trader.cache.adapter import CachePostgresAdapter
 from nautilus_trader.cache.base import CacheFacade
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.cache.database import CacheDatabaseAdapter
@@ -317,11 +318,13 @@ class NautilusKernel:
                 ),
                 config=config.cache,
             )
+        elif config.cache.database.type == "postgres":
+            cache_db = CachePostgresAdapter(config=config.cache)
         else:
             raise ValueError(
                 f"Unrecognized `config.cache.database.type`, was '{config.cache.database.type}'. "
-                "The only database type currently supported is 'redis', if you don't want a cache database backing "
-                "then you can pass `None` for the `cache.database` ('in-memory' is no longer valid)",
+                "Supported types are 'redis' and 'postgres'. "
+                "If you don't want a cache database backing then pass `None` for `cache.database`.",
             )
 
         ########################################################################
