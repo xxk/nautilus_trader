@@ -1,6 +1,6 @@
 # Change Topic: Nautilus 合约明细落 PostgreSQL（官方方案优先）
 
-**状态**：in_progress
+**状态**：in_progress（change-01 已通过，change-02 代码与测试已落地，待 Linux 验收）
 **日期**：2026-03-27
 **主题范围**：Nautilus 官方 PostgreSQL 合约明细持久化
 

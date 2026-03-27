@@ -68,6 +68,9 @@ class CachePostgresAdapter(CacheDatabaseFacade):
     def dispose(self):
         self._backing.close()
 
+    def close(self):
+        self._backing.close()
+
     def flush(self):
         self._backing.flush_db()
 
@@ -88,7 +91,35 @@ class CachePostgresAdapter(CacheDatabaseFacade):
     def load_instrument(self, instrument_id: InstrumentId) -> Instrument:
         instrument_id_pyo3 = nautilus_pyo3.InstrumentId.from_str(str(instrument_id))
         instrument_pyo3 = self._backing.load_instrument(instrument_id_pyo3)
+        if instrument_pyo3 is None:
+            return None
         return transform_instrument_from_pyo3(instrument_pyo3)
+
+    def load_instruments(self) -> dict[InstrumentId, Instrument]:
+        instruments = self._backing.load_instruments()
+        result = {}
+        for instrument in instruments:
+            transformed = transform_instrument_from_pyo3(instrument)
+            result[transformed.id] = transformed
+        return result
+
+    def load_synthetics(self) -> dict:
+        return {}
+
+    def load_accounts(self) -> dict:
+        return {}
+
+    def load_orders(self):
+        return {}
+
+    def load_positions(self) -> dict:
+        return {}
+
+    def load_index_order_position(self) -> dict:
+        return {}
+
+    def load_index_order_client(self) -> dict:
+        return {}
 
     def load_order(self, client_order_id: ClientOrderId):
         order_id_pyo3 = nautilus_pyo3.ClientOrderId.from_str(str(client_order_id))
@@ -96,10 +127,6 @@ class CachePostgresAdapter(CacheDatabaseFacade):
         if order_pyo3:
             return transform_order_from_pyo3(order_pyo3)
         return None
-
-    def load_orders(self):
-        orders = self._backing.load_orders()
-        return [transform_order_from_pyo3(order) for order in orders]
 
     def load_account(self, account_id: AccountId):
         account_id_pyo3 = nautilus_pyo3.AccountId.from_str(str(account_id))

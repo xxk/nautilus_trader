@@ -13,7 +13,6 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-from unittest.mock import Mock
 from unittest.mock import patch
 
 from nautilus_trader.common import Environment
@@ -25,6 +24,7 @@ from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import NautilusKernelConfig
 from nautilus_trader.config import RiskEngineConfig
 from nautilus_trader.system.kernel import NautilusKernel
+from nautilus_trader.test_kit.mocks.cache_database import MockCacheDatabase
 
 
 def test_kernel_uses_postgres_cache_adapter_when_configured() -> None:
@@ -48,7 +48,7 @@ def test_kernel_uses_postgres_cache_adapter_when_configured() -> None:
         logging=LoggingConfig(bypass_logging=True),
     )
 
-    adapter = Mock()
+    adapter = MockCacheDatabase()
 
     # Act
     with patch("nautilus_trader.system.kernel.CachePostgresAdapter", return_value=adapter) as adapter_ctor:

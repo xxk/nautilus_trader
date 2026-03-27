@@ -1,5 +1,7 @@
 # Change 02: Live 合约明细自动落库与重载验证
 
+**状态**：in_progress（代码与测试已落地，待 Linux + PostgreSQL 环境验收）
+
 ## 1. 目标
 
 基于 `change-01` 提供的 PostgreSQL cache backend 装配能力，验证并补齐 Live 运行时的合约明细自动落库、自动重载和更新覆盖能力。
@@ -63,6 +65,28 @@
 - 在示例或开发文档中给出 PostgreSQL cache backend 的配置示例。
 - 明确说明该能力针对运行态 cache，不是 Parquet catalog。
 
+最小配置示例如下：
+
+```python
+from nautilus_trader.config import CacheConfig
+from nautilus_trader.config import DatabaseConfig
+from nautilus_trader.config import TradingNodeConfig
+
+config = TradingNodeConfig(
+	cache=CacheConfig(
+		flush_on_start=False,
+		database=DatabaseConfig(
+			type="postgres",
+			host="localhost",
+			port=5432,
+			username="nautilus",
+			password="pass",
+			database="nautilus",
+		),
+	),
+)
+```
+
 ## 6. 详细验收标准
 
 ### 自动落库验收
@@ -92,3 +116,36 @@
 ## 7. 完成定义
 
 本 change 完成后，用户已经可以通过标准官方配置，在 Live 节点运行期间把合约明细自动落到 PostgreSQL，并在重启时重新加载这些合约明细。
+
+## 8. 当前执行记录
+
+### 已完成改动
+
+- 已在 `tests/integration_tests/live/test_live_node_cache.py` 增加 PostgreSQL Live cache 集成测试。
+- 已覆盖官方 `DataEngine.process(instrument) -> Cache.add_instrument(...) -> PostgreSQL` 写入链路。
+- 已覆盖节点重启后 `flush_on_start=False` 的 instrument 重载断言。
+- 已覆盖同一 `instrument.id` 更新后的 upsert / 最新版本重载断言。
+- 已补齐 `MockCacheDatabase.close()`，修复本轮改动牵出的 cache dispose 单测桩缺口。
+
+### 当前验证结果
+
+- 已验证事实：`d:/Nautilus/Nautilus/.venv/Scripts/python.exe -m pytest tests/unit_tests/live/test_node_cache.py tests/integration_tests/live/test_live_node_cache.py -q` 结果为 `1 passed, 4 skipped`。
+- 已验证事实：4 个 skipped 都来自 `tests/integration_tests/live/test_live_node_cache.py` 的平台限制 `sys.platform != "linux"`，说明当前 Windows 环境只能完成收集与导入校验，不能执行 PostgreSQL live 集成验收。
+- 已验证事实：新增 PostgreSQL Live 测试已被 pytest 成功收集，未出现导入错误、语法错误或夹具初始化错误。
+- 已验证事实：本机 `postgresql-x64-16` 服务可用，已创建默认验收账号/库 `nautilus/pass@127.0.0.1:5432/nautilus`。
+- 已验证事实：已导入仓库官方 schema `schema/sql/types.sql` + `schema/sql/tables.sql`，并通过 `CachePostgresAdapter` 在 Windows 本机完成一次真实 `add_instrument/load_instrument` 读写验证。
+- 当前结论：本 change 已完成代码与测试落地，但尚未达到“AI 已执行通过，待人工确认”；剩余阻塞是 Linux + PostgreSQL 验收环境缺失，而非当前代码路径已知失败。
+
+### 下一步验收命令
+
+在 Linux 且 PostgreSQL 服务可用的环境执行：
+
+```bash
+python -m pytest tests/integration_tests/live/test_live_node_cache.py -q
+```
+
+目标结果：
+
+- PostgreSQL 场景不再 skipped。
+- 新增的 2 个 PostgreSQL Live 测试通过。
+- Redis 现有 `flush_on_start` 场景继续通过。

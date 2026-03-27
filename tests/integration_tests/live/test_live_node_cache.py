@@ -14,12 +14,14 @@
 # -------------------------------------------------------------------------------------------------
 
 import asyncio
+import os
 import sys
 import time
 
 import msgspec
 import pytest
 
+from nautilus_trader.cache.adapter import CachePostgresAdapter
 from nautilus_trader.cache.database import CacheDatabaseAdapter
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.component import TestClock
@@ -32,6 +34,7 @@ from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import TraderId
+from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.position import Position
@@ -47,16 +50,20 @@ from nautilus_trader.trading.strategy import Strategy
 
 _AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
 
-# Requirements:
-# - A Redis service listening on the default port 6379
 
-pytestmark = pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="databases only supported on Linux",
-)
+def _live_test_logging_config() -> LoggingConfig:
+    return LoggingConfig(
+        log_level="ERROR",
+        log_level_file="OFF",
+        log_colors=False,
+    )
 
 
 @pytest.mark.xdist_group(name="redis_integration")
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="Redis live cache integration is only exercised on Linux in this suite",
+)
 class TestTradingNodeCacheFlushOnStart:
     """
     Tests that kernel skips load_cache() when flush_on_start=True.
@@ -146,7 +153,7 @@ class TestTradingNodeCacheFlushOnStart:
         loop = asyncio.get_running_loop()
         config = TradingNodeConfig(
             trader_id=self.trader_id,
-            logging=LoggingConfig(bypass_logging=True),
+            logging=_live_test_logging_config(),
             cache=CacheConfig(database=DatabaseConfig(), flush_on_start=True),
         )
         node = TradingNode(config=config, loop=loop)
@@ -168,7 +175,7 @@ class TestTradingNodeCacheFlushOnStart:
         loop = asyncio.get_running_loop()
         config = TradingNodeConfig(
             trader_id=self.trader_id,
-            logging=LoggingConfig(bypass_logging=True),
+            logging=_live_test_logging_config(),
             cache=CacheConfig(database=DatabaseConfig(), flush_on_start=False),
         )
         node = TradingNode(config=config, loop=loop)
@@ -176,3 +183,156 @@ class TestTradingNodeCacheFlushOnStart:
         # Assert: In-memory cache should have the position loaded from Redis
         assert len(node.kernel.cache.orders()) > 0
         assert len(node.kernel.cache.positions()) > 0
+
+
+@pytest.mark.xdist_group(name="postgres_integration")
+class TestTradingNodeCachePostgresInstruments:
+    def setup(self) -> None:
+        os.environ["POSTGRES_HOST"] = "localhost"
+        os.environ["POSTGRES_PORT"] = "5432"
+        os.environ["POSTGRES_USERNAME"] = "nautilus"
+        os.environ["POSTGRES_PASSWORD"] = "pass"
+        os.environ["POSTGRES_DATABASE"] = "nautilus"
+
+        self.cache_config = CacheConfig(
+            database=DatabaseConfig(
+                type="postgres",
+                host="localhost",
+                port=5432,
+                username="nautilus",
+                password="pass",
+                database="nautilus",
+            ),
+        )
+
+        try:
+            self.database = CachePostgresAdapter(config=self.cache_config)
+            self.database.flush()
+        except BaseException as e:
+            message = str(e)
+            if (
+                "error communicating with database" in message
+                or "Operation not permitted" in message
+            ):
+                pytest.skip(
+                    "Postgres service not available; skipping TradingNode Postgres integration tests.",
+                )
+                return
+            raise
+
+        self.trader_id = TraderId("TESTER-000")
+
+    def teardown(self) -> None:
+        time.sleep(0.2)
+
+        database = getattr(self, "database", None)
+        if database is not None:
+            database.flush()
+            database.dispose()
+
+        time.sleep(0.5)
+        try:
+            ensure_all_tasks_completed()
+        except RuntimeError:
+            return
+
+    def _create_node(self, flush_on_start: bool) -> TradingNode:
+        loop = asyncio.get_running_loop()
+        config = TradingNodeConfig(
+            trader_id=self.trader_id,
+            logging=_live_test_logging_config(),
+            cache=CacheConfig(
+                database=self.cache_config.database,
+                flush_on_start=flush_on_start,
+            ),
+        )
+        return TradingNode(config=config, loop=loop)
+
+    @staticmethod
+    def _updated_audusd(min_price: str, ts_event: int, ts_init: int) -> CurrencyPair:
+        return CurrencyPair(
+            instrument_id=_AUDUSD_SIM.id,
+            raw_symbol=_AUDUSD_SIM.raw_symbol,
+            base_currency=_AUDUSD_SIM.base_currency,
+            quote_currency=_AUDUSD_SIM.quote_currency,
+            price_precision=_AUDUSD_SIM.price_precision,
+            size_precision=_AUDUSD_SIM.size_precision,
+            price_increment=_AUDUSD_SIM.price_increment,
+            size_increment=_AUDUSD_SIM.size_increment,
+            lot_size=_AUDUSD_SIM.lot_size,
+            max_quantity=_AUDUSD_SIM.max_quantity,
+            min_quantity=_AUDUSD_SIM.min_quantity,
+            max_price=_AUDUSD_SIM.max_price,
+            min_price=Price.from_str(min_price),
+            max_notional=_AUDUSD_SIM.max_notional,
+            min_notional=_AUDUSD_SIM.min_notional,
+            margin_init=_AUDUSD_SIM.margin_init,
+            margin_maint=_AUDUSD_SIM.margin_maint,
+            maker_fee=_AUDUSD_SIM.maker_fee,
+            taker_fee=_AUDUSD_SIM.taker_fee,
+            tick_scheme_name=_AUDUSD_SIM.tick_scheme_name,
+            ts_event=ts_event,
+            ts_init=ts_init,
+        )
+
+    @pytest.mark.asyncio
+    async def test_process_instrument_persists_to_postgres_and_reloads_on_restart(self):
+        node = self._create_node(flush_on_start=True)
+
+        try:
+            node.kernel.data_engine.start()
+            node.kernel.data_engine.process(_AUDUSD_SIM)
+
+            await eventually(
+                lambda: self.database.load_instrument(_AUDUSD_SIM.id),
+                timeout=5.0,
+            )
+
+            persisted = self.database.load_instrument(_AUDUSD_SIM.id)
+            assert persisted == _AUDUSD_SIM
+        finally:
+            node.dispose()
+
+        reloaded_node = self._create_node(flush_on_start=False)
+        try:
+            reloaded = reloaded_node.kernel.cache.instrument(_AUDUSD_SIM.id)
+            assert reloaded == _AUDUSD_SIM
+        finally:
+            reloaded_node.dispose()
+
+    @pytest.mark.asyncio
+    async def test_process_instrument_update_reloads_latest_version_from_postgres(self):
+        node = self._create_node(flush_on_start=True)
+        updated = self._updated_audusd(min_price="111", ts_event=123, ts_init=456)
+
+        try:
+            node.kernel.data_engine.start()
+            node.kernel.data_engine.process(_AUDUSD_SIM)
+            await eventually(
+                lambda: self.database.load_instrument(_AUDUSD_SIM.id),
+                timeout=5.0,
+            )
+
+            node.kernel.data_engine.process(updated)
+            await eventually(
+                lambda: self.database.load_instrument(_AUDUSD_SIM.id).min_price == Price.from_str("111"),
+                timeout=5.0,
+            )
+
+            persisted = self.database.load_instrument(_AUDUSD_SIM.id)
+            assert persisted.id == _AUDUSD_SIM.id
+            assert persisted.ts_event == 123
+            assert persisted.ts_init == 456
+            assert persisted.min_price == Price.from_str("111")
+        finally:
+            node.dispose()
+
+        reloaded_node = self._create_node(flush_on_start=False)
+        try:
+            reloaded = reloaded_node.kernel.cache.instrument(_AUDUSD_SIM.id)
+            assert reloaded.id == _AUDUSD_SIM.id
+            assert reloaded.ts_event == 123
+            assert reloaded.ts_init == 456
+            assert reloaded.min_price == Price.from_str("111")
+        finally:
+            reloaded_node.dispose()

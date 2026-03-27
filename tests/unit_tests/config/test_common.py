@@ -128,7 +128,7 @@ def test_json() -> None:
     # Act, Assert
     assert (
         config.json()
-        == b'{"type":"redis","host":null,"port":null,"username":null,"password":null,"database":null,"ssl":false,"timeout":20}'
+        == b'{"type":"redis","host":null,"port":null,"username":null,"password":null,"ssl":false,"timeout":20,"database":null}'
     )
 
 

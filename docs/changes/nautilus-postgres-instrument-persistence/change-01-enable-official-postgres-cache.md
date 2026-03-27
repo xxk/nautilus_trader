@@ -1,6 +1,6 @@
 # Change 01: 打通官方 PostgreSQL Cache Backend 装配
 
-**状态**：in_progress（代码已完成，Windows 本地验证受环境阻塞）
+**状态**：AI 已执行通过，待人工确认
 
 ## 1. 目标
 
@@ -109,18 +109,18 @@
 ### 当前验证结论
 
 - 已验证事实：`change-01` 需要的代码路径已经补齐，且新增单测覆盖了 kernel 的 postgres 分支选择语义。
-- 已验证事实：当前 Windows 本地 `.venv` 初始只有 `pip`，缺少 pytest 与项目依赖。
-- 已验证事实：执行 `uv sync --all-extras` 时，editable 构建失败，根因是本机缺少 `clang`。
-- 已验证事实：在当前环境中执行 import 检查时，`import nautilus_trader` 失败于 `ModuleNotFoundError: nautilus_trader.core.data`，说明仓库未具备可直接运行测试的已编译扩展。
-- 推断结论：`change-01` 的代码改动方向正确，但在当前机器上尚不能声明“已验收通过”，因为缺少可运行测试所需的本地编译环境。
+- 已验证事实：当前 Windows 本地环境已经补齐源码构建前置，`nautilus-trader` editable 安装成功。
+- 已验证事实：目标 pytest 集合通过，覆盖 `DatabaseConfig` 的 `dict/json/id` 断言和 kernel 的 postgres cache backend 选择逻辑。
+- 已验证事实：`nautilus_trader` 与 `NautilusKernel` 已可在当前 `.venv` 中正常 import。
+- 当前结论：本 change 已达到“AI 已执行通过，待人工确认”状态。
 
 ### 本轮验证命令与结果
 
-1. `d:/Nautilus/Nautilus/.venv/Scripts/python.exe -m pytest ...`
-   - 结果：失败，原因是环境内未安装 `pytest`
-2. `Set-Location d:/Nautilus/Nautilus; uv sync --all-extras`
-   - 结果：失败，`build.py` 要求 `clang`，当前 Windows 环境不存在该编译器
-3. Python import 检查
-   - 结果：失败，`ModuleNotFoundError: nautilus_trader.core.data`
+1. `Set-Location d:/Nautilus/Nautilus; uv sync --all-extras --group test --group dev`
+  - 结果：通过，editable 安装完成，测试依赖齐备
+2. `d:/Nautilus/Nautilus/.venv/Scripts/python.exe -m pytest tests/unit_tests/config/test_common.py -k "test_dict or test_json or test_config_id" tests/unit_tests/live/test_node_cache.py -q`
+  - 结果：通过，`9 passed`
+3. `d:/Nautilus/Nautilus/.venv/Scripts/python.exe -c "import nautilus_trader; from nautilus_trader.system.kernel import NautilusKernel; ..."`
+  - 结果：通过，`kernel-import-ok`
 4. `python -m compileall nautilus_trader/cache/adapter.py nautilus_trader/common/config.py nautilus_trader/system/kernel.py tests/unit_tests/config/test_common.py tests/unit_tests/live/test_node_cache.py`
   - 结果：通过，当前改动文件无语法错误
