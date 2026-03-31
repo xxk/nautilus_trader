@@ -39,7 +39,9 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BookOrder {
+    /// Represents an order in a book.
     #[new]
     fn py_new(side: OrderSide, price: Price, size: Quantity, order_id: OrderId) -> Self {
         Self::new(side, price, size, order_id)
@@ -97,11 +99,13 @@ impl BookOrder {
         format!("{}:{}", PY_MODULE_MODEL, stringify!(BookOrder))
     }
 
+    /// Returns the order exposure as an `f64`.
     #[pyo3(name = "exposure")]
     fn py_exposure(&self) -> f64 {
         self.exposure()
     }
 
+    /// Returns the signed order size as `f64`, positive for buys, negative for sells.
     #[pyo3(name = "signed_size")]
     fn py_signed_size(&self) -> f64 {
         self.signed_size()
@@ -116,18 +120,6 @@ impl BookOrder {
     #[pyo3(name = "from_dict")]
     pub fn py_from_dict(py: Python<'_>, values: Py<PyDict>) -> PyResult<Self> {
         from_dict_pyo3(py, values)
-    }
-
-    #[staticmethod]
-    #[pyo3(name = "from_json")]
-    fn py_from_json(data: &[u8]) -> PyResult<Self> {
-        Self::from_json_bytes(data).map_err(to_pyvalue_err)
-    }
-
-    #[staticmethod]
-    #[pyo3(name = "from_msgpack")]
-    fn py_from_msgpack(data: &[u8]) -> PyResult<Self> {
-        Self::from_msgpack_bytes(data).map_err(to_pyvalue_err)
     }
 
     /// Converts the `BookOrder` into a Python dict representation.
@@ -150,6 +142,21 @@ impl BookOrder {
     #[pyo3(name = "to_msgpack_bytes")]
     fn py_to_msgpack_bytes(&self, py: Python<'_>) -> Py<PyAny> {
         self.to_msgpack_bytes().unwrap().into_py_any_unwrap(py)
+    }
+}
+
+#[pymethods]
+impl BookOrder {
+    #[staticmethod]
+    #[pyo3(name = "from_json")]
+    fn py_from_json(data: &[u8]) -> PyResult<Self> {
+        Self::from_json_bytes(data).map_err(to_pyvalue_err)
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "from_msgpack")]
+    fn py_from_msgpack(data: &[u8]) -> PyResult<Self> {
+        Self::from_msgpack_bytes(data).map_err(to_pyvalue_err)
     }
 }
 

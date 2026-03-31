@@ -98,9 +98,14 @@ make cargo-test-crate-nautilus-serialization FEATURES="capnp"
 
 - Name test functions after what they exercise; you do not need to encode the expected assertions in the name.
 - Add docstrings when they clarify setup, scenarios, or expectations.
-- Prefer pytest-style free functions for Python tests instead of test classes with setup methods.
+- Use pytest-style free functions and fixtures for Python tests under `python/tests/`.
+  Do not use test classes.
 - **Group assertions** when possible: perform all setup/act steps first, then assert together to avoid the act-assert-act smell.
 - Use `unwrap`, `expect`, or direct `panic!`/`assert` calls inside tests; clarity and conciseness matter more than defensive error handling here.
+- Do not capture log output to assert on log messages. Log capture in tests is fragile because
+  loggers are global state, test execution order is non-deterministic, and the assertions
+  break when log wording changes. Instead, verify the observable behavior (return values,
+  state changes, side effects) that the log message reflects.
 
 For Rust-specific test conventions (module structure, `#[rstest]`, parameterization), see the [Rust guide](rust.md#testing-conventions).
 

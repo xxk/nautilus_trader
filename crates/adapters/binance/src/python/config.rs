@@ -24,7 +24,11 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BinanceDataClientConfig {
+    /// Configuration for Binance data client.
+    ///
+    /// Ed25519 API keys are required for SBE WebSocket streams.
     #[new]
     #[pyo3(signature = (
         product_types = None,
@@ -33,6 +37,7 @@ impl BinanceDataClientConfig {
         base_url_ws = None,
         api_key = None,
         api_secret = None,
+        instrument_status_poll_secs = None,
     ))]
     fn py_new(
         product_types: Option<Vec<BinanceProductType>>,
@@ -41,6 +46,7 @@ impl BinanceDataClientConfig {
         base_url_ws: Option<String>,
         api_key: Option<String>,
         api_secret: Option<String>,
+        instrument_status_poll_secs: Option<u64>,
     ) -> Self {
         Self {
             product_types: product_types.unwrap_or_else(|| vec![BinanceProductType::Spot]),
@@ -49,6 +55,7 @@ impl BinanceDataClientConfig {
             base_url_ws,
             api_key,
             api_secret,
+            instrument_status_poll_secs: instrument_status_poll_secs.unwrap_or(3600),
         }
     }
 
@@ -58,7 +65,13 @@ impl BinanceDataClientConfig {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl BinanceExecClientConfig {
+    /// Configuration for Binance execution client.
+    ///
+    /// Ed25519 API keys are required for execution clients. Binance deprecated
+    /// listenKey-based user data streams in favor of WebSocket API authentication,
+    /// which only supports Ed25519.
     #[new]
     #[pyo3(signature = (
         trader_id,
@@ -67,6 +80,8 @@ impl BinanceExecClientConfig {
         environment = None,
         base_url_http = None,
         base_url_ws = None,
+        base_url_ws_trading = None,
+        use_ws_trading = true,
         api_key = None,
         api_secret = None,
     ))]
@@ -78,6 +93,8 @@ impl BinanceExecClientConfig {
         environment: Option<BinanceEnvironment>,
         base_url_http: Option<String>,
         base_url_ws: Option<String>,
+        base_url_ws_trading: Option<String>,
+        use_ws_trading: bool,
         api_key: Option<String>,
         api_secret: Option<String>,
     ) -> Self {
@@ -88,6 +105,8 @@ impl BinanceExecClientConfig {
             environment: environment.unwrap_or(BinanceEnvironment::Mainnet),
             base_url_http,
             base_url_ws,
+            base_url_ws_trading,
+            use_ws_trading,
             api_key,
             api_secret,
         }

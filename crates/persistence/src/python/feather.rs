@@ -34,6 +34,7 @@ use nautilus_model::{
     },
     python::instruments::pyobject_to_instrument_any,
 };
+use object_store::ObjectStoreExt;
 use pyo3::{exceptions::PyIOError, prelude::*};
 
 use crate::{
@@ -46,12 +47,14 @@ use crate::{
 /// This provides a streaming writer of Nautilus objects into feather files with rotation
 /// capabilities, matching the interface of Python's `StreamingFeatherWriter`.
 #[pyclass(module = "nautilus_trader.core.nautilus_pyo3.persistence", unsendable)]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.persistence")]
 pub struct StreamingFeatherWriterV2 {
     writer: Rc<RefCell<FeatherWriter>>,
     handler: Option<ShareableMessageHandler>,
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl StreamingFeatherWriterV2 {
     /// Creates a new `StreamingFeatherWriterV2` instance.
     ///

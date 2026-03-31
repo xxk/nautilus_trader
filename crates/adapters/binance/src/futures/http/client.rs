@@ -17,12 +17,18 @@
 
 use std::{collections::HashMap, num::NonZeroU32, sync::Arc, time::Duration};
 
+use ahash::AHashMap;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use nautilus_core::{consts::NAUTILUS_USER_AGENT, nanos::UnixNanos, time::AtomicTime};
+use nautilus_core::{
+    consts::NAUTILUS_USER_AGENT, datetime::SECONDS_IN_DAY, nanos::UnixNanos, time::AtomicTime,
+};
 use nautilus_model::{
     data::{Bar, BarType, TradeTick},
-    enums::{AggregationSource, AggressorSide, BarAggregation, OrderSide, OrderType, TimeInForce},
+    enums::{
+        AggregationSource, AggressorSide, BarAggregation, MarketStatusAction, OrderSide, OrderType,
+        TimeInForce,
+    },
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
     instruments::any::InstrumentAny,
@@ -65,12 +71,12 @@ use crate::common::{
         BINANCE_DAPI_PATH, BINANCE_DAPI_RATE_LIMITS, BINANCE_FAPI_PATH, BINANCE_FAPI_RATE_LIMITS,
         BINANCE_NAUTILUS_FUTURES_BROKER_ID, BinanceRateLimitQuota,
     },
-    credential::Credential,
+    credential::SigningCredential,
     encoder::encode_broker_id,
     enums::{
         BinanceAlgoType, BinanceEnvironment, BinanceFuturesOrderType, BinancePositionSide,
         BinanceProductType, BinanceRateLimitInterval, BinanceRateLimitType, BinanceSide,
-        BinanceTimeInForce,
+        BinanceTimeInForce, BinanceWorkingType,
     },
     models::BinanceErrorResponse,
     parse::{parse_coinm_instrument, parse_usdm_instrument},
@@ -87,7 +93,7 @@ pub struct BinanceRawFuturesHttpClient {
     client: HttpClient,
     base_url: String,
     api_path: &'static str,
-    credential: Option<Credential>,
+    credential: Option<SigningCredential>,
     recv_window: Option<u64>,
     order_rate_keys: Vec<String>,
 }
@@ -122,7 +128,7 @@ impl BinanceRawFuturesHttpClient {
         } = Self::rate_limit_config(product_type);
 
         let credential = match (api_key, api_secret) {
-            (Some(key), Some(secret)) => Some(Credential::new(key, secret)),
+            (Some(key), Some(secret)) => Some(SigningCredential::new(key, secret)),
             (None, None) => None,
             _ => return Err(BinanceFuturesHttpError::MissingCredentials),
         };
@@ -460,7 +466,7 @@ impl BinanceRawFuturesHttpClient {
         Err(BinanceFuturesHttpError::UnexpectedStatus { status, body })
     }
 
-    fn default_headers(credential: &Option<Credential>) -> HashMap<String, String> {
+    fn default_headers(credential: &Option<SigningCredential>) -> HashMap<String, String> {
         let mut headers = HashMap::new();
         headers.insert("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string());
 
@@ -524,7 +530,8 @@ impl BinanceRawFuturesHttpClient {
             BinanceRateLimitInterval::Second => Quota::per_second(burst),
             BinanceRateLimitInterval::Minute => Some(Quota::per_minute(burst)),
             BinanceRateLimitInterval::Day => {
-                Quota::with_period(Duration::from_secs(86_400)).map(|q| q.allow_burst(burst))
+                Quota::with_period(Duration::from_secs(SECONDS_IN_DAY))
+                    .map(|q| q.allow_burst(burst))
             }
         }
     }
@@ -1072,10 +1079,6 @@ impl BinanceFuturesInstrument {
 
 /// Binance Futures HTTP client for USD-M and COIN-M perpetuals.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", from_py_object)
-)]
 pub struct BinanceFuturesHttpClient {
     raw: BinanceRawFuturesHttpClient,
     product_type: BinanceProductType,
@@ -1253,6 +1256,52 @@ impl BinanceFuturesHttpClient {
         }
 
         Ok(())
+    }
+
+    /// Fetches exchange info and returns the current status of each symbol.
+    ///
+    /// Builds a fresh status snapshot from the response without disturbing the
+    /// shared instruments cache, so a transient failure does not break other
+    /// HTTP operations that depend on cached precision data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the product type is invalid.
+    pub async fn request_symbol_statuses(
+        &self,
+    ) -> BinanceFuturesHttpResult<AHashMap<Ustr, MarketStatusAction>> {
+        let mut statuses = AHashMap::new();
+
+        match self.product_type {
+            BinanceProductType::UsdM => {
+                let info: BinanceFuturesUsdExchangeInfo = self
+                    .raw
+                    .get("exchangeInfo", None::<&()>, false, false)
+                    .await?;
+                for symbol in &info.symbols {
+                    statuses.insert(symbol.symbol, MarketStatusAction::from(symbol.status));
+                }
+            }
+            BinanceProductType::CoinM => {
+                let info: BinanceFuturesCoinExchangeInfo = self
+                    .raw
+                    .get("exchangeInfo", None::<&()>, false, false)
+                    .await?;
+                for symbol in &info.symbols {
+                    let action = symbol
+                        .contract_status
+                        .map_or(MarketStatusAction::NotAvailableForTrading, Into::into);
+                    statuses.insert(symbol.symbol, action);
+                }
+            }
+            _ => {
+                return Err(BinanceFuturesHttpError::ValidationError(
+                    "Invalid product type for futures".to_string(),
+                ));
+            }
+        }
+
+        Ok(statuses)
     }
 
     /// Fetches exchange information and returns parsed Nautilus instruments.
@@ -1607,7 +1656,11 @@ impl BinanceFuturesHttpClient {
         price: Option<Price>,
         trigger_price: Option<Price>,
         reduce_only: bool,
+        close_position: bool,
         position_side: Option<BinancePositionSide>,
+        activation_price: Option<Price>,
+        callback_rate: Option<String>,
+        working_type: Option<BinanceWorkingType>,
     ) -> anyhow::Result<OrderStatusReport> {
         let symbol = format_binance_symbol(&instrument_id);
         let size_precision = self.get_size_precision(&symbol)?;
@@ -1625,34 +1678,62 @@ impl BinanceFuturesHttpClient {
         let requires_time_in_force =
             matches!(order_type, OrderType::StopLimit | OrderType::LimitIfTouched);
 
-        let qty_str = quantity.to_string();
         let price_str = price.map(|p| p.to_string());
         let trigger_price_str = trigger_price.map(|p| p.to_string());
         let client_id_str = encode_broker_id(&client_order_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID);
 
-        let params = BinanceNewAlgoOrderParams {
-            symbol,
-            side: binance_side,
-            order_type: binance_order_type,
-            algo_type: BinanceAlgoType::Conditional,
-            position_side,
-            quantity: Some(qty_str),
-            price: price_str,
-            trigger_price: trigger_price_str,
-            time_in_force: if requires_time_in_force {
-                Some(binance_tif)
-            } else {
-                None
-            },
-            working_type: None,
-            close_position: None,
-            price_protect: None,
-            reduce_only: if reduce_only { Some(true) } else { None },
-            activation_price: None,
-            callback_rate: None,
-            client_algo_id: Some(client_id_str),
-            good_till_date: None,
-            recv_window: None,
+        // closePosition is mutually exclusive with quantity and reduceOnly
+        let params = if close_position {
+            BinanceNewAlgoOrderParams {
+                symbol,
+                side: binance_side,
+                order_type: binance_order_type,
+                algo_type: BinanceAlgoType::Conditional,
+                position_side,
+                quantity: None,
+                price: price_str,
+                trigger_price: trigger_price_str,
+                time_in_force: if requires_time_in_force {
+                    Some(binance_tif)
+                } else {
+                    None
+                },
+                working_type,
+                close_position: Some(true),
+                price_protect: None,
+                reduce_only: None,
+                activation_price: activation_price.map(|p| p.to_string()),
+                callback_rate,
+                client_algo_id: Some(client_id_str),
+                good_till_date: None,
+                recv_window: None,
+            }
+        } else {
+            let qty_str = quantity.to_string();
+            BinanceNewAlgoOrderParams {
+                symbol,
+                side: binance_side,
+                order_type: binance_order_type,
+                algo_type: BinanceAlgoType::Conditional,
+                position_side,
+                quantity: Some(qty_str),
+                price: price_str,
+                trigger_price: trigger_price_str,
+                time_in_force: if requires_time_in_force {
+                    Some(binance_tif)
+                } else {
+                    None
+                },
+                working_type,
+                close_position: None,
+                price_protect: None,
+                reduce_only: if reduce_only { Some(true) } else { None },
+                activation_price: activation_price.map(|p| p.to_string()),
+                callback_rate,
+                client_algo_id: Some(client_id_str),
+                good_till_date: None,
+                recv_window: None,
+            }
         };
 
         let order = self.raw.submit_algo_order(&params).await?;
@@ -2143,7 +2224,7 @@ impl BinanceFuturesHttpClient {
         for trade in trades {
             let price: f64 = trade.price.parse().unwrap_or(0.0);
             let size: f64 = trade.qty.parse().unwrap_or(0.0);
-            let ts_event = UnixNanos::from((trade.time * 1_000_000) as u64);
+            let ts_event = UnixNanos::from_millis(trade.time as u64);
 
             let aggressor_side = if trade.is_buyer_maker {
                 AggressorSide::Seller
@@ -2222,7 +2303,7 @@ impl BinanceFuturesHttpClient {
             let volume: f64 = kline.volume.parse().unwrap_or(0.0);
 
             // close_time is end of interval, add 1ms for next bar's open
-            let ts_event = UnixNanos::from((kline.close_time * 1_000_000) as u64);
+            let ts_event = UnixNanos::from_millis(kline.close_time as u64);
 
             let bar = Bar::new(
                 bar_type,
@@ -2258,7 +2339,9 @@ pub fn is_algo_order_type(order_type: OrderType) -> bool {
 }
 
 /// Converts a Nautilus order type to a Binance Futures order type.
-fn order_type_to_binance_futures(order_type: OrderType) -> anyhow::Result<BinanceFuturesOrderType> {
+pub(crate) fn order_type_to_binance_futures(
+    order_type: OrderType,
+) -> anyhow::Result<BinanceFuturesOrderType> {
     match order_type {
         OrderType::Market => Ok(BinanceFuturesOrderType::Market),
         OrderType::Limit => Ok(BinanceFuturesOrderType::Limit),

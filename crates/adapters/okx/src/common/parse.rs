@@ -17,6 +17,7 @@
 
 use std::str::FromStr;
 
+use anyhow::Context;
 pub use nautilus_core::serialization::{
     deserialize_empty_string_as_none, deserialize_empty_ustr_as_none,
     deserialize_optional_string_to_u64, deserialize_string_to_u64,
@@ -63,8 +64,8 @@ use crate::{
         models::OKXInstrument,
     },
     http::models::{
-        OKXAccount, OKXBalanceDetail, OKXCandlestick, OKXIndexTicker, OKXMarkPrice,
-        OKXOrderHistory, OKXPosition, OKXTrade, OKXTransactionDetail,
+        OKXAccount, OKXBalanceDetail, OKXCandlestick, OKXFundingRateHistory, OKXIndexTicker,
+        OKXMarkPrice, OKXOrderHistory, OKXPosition, OKXTrade, OKXTransactionDetail,
     },
     websocket::{enums::OKXWsChannel, messages::OKXFundingRateMsg},
 };
@@ -219,6 +220,19 @@ pub fn parse_base_quote_from_symbol(symbol: &str) -> anyhow::Result<(&str, &str)
     Ok((base, quote))
 }
 
+/// Extracts the instrument family from an OKX symbol string.
+///
+/// All OKX derivative symbols encode the family as the first two segments:
+/// `BTC-USD-250328-92000-C` -> `BTC-USD`, `BTC-USDT-SWAP` -> `BTC-USDT`.
+///
+/// # Errors
+///
+/// Returns an error if the symbol does not contain at least two dash-separated parts.
+pub fn extract_inst_family(symbol: &str) -> anyhow::Result<Ustr> {
+    let (base, quote) = parse_base_quote_from_symbol(symbol)?;
+    Ok(Ustr::from(&format!("{base}-{quote}")))
+}
+
 /// Maps an [`OKXInstrumentStatus`] to a Nautilus [`MarketStatusAction`].
 #[must_use]
 pub fn okx_status_to_market_action(status: OKXInstrumentStatus) -> MarketStatusAction {
@@ -264,6 +278,10 @@ pub fn parse_rfc3339_timestamp(timestamp: &str) -> anyhow::Result<UnixNanos> {
     let nanos = dt.timestamp_nanos_opt().ok_or_else(|| {
         anyhow::anyhow!("Failed to extract nanoseconds from timestamp: {timestamp}")
     })?;
+
+    if nanos < 0 {
+        anyhow::bail!("Negative nanosecond timestamp from: {timestamp}");
+    }
     Ok(UnixNanos::from(nanos as u64))
 }
 
@@ -403,8 +421,8 @@ pub fn parse_index_price_update(
 ///
 /// # Errors
 ///
-/// Returns an error if the `funding_rate` or `next_funding_rate` fields fail
-/// to parse into Decimal values.
+/// Returns an error if the `funding_rate` field fails
+/// to parse into a Decimal value or `next_funding_time` fails to parse into a positive, in bounds interval.
 pub fn parse_funding_rate_msg(
     msg: &OKXFundingRateMsg,
     instrument_id: InstrumentId,
@@ -416,15 +434,53 @@ pub fn parse_funding_rate_msg(
         .parse::<Decimal>()
         .map_err(|e| anyhow::anyhow!("Invalid funding_rate value: {e}"))?;
 
-    let funding_time = Some(parse_millisecond_timestamp(msg.funding_time));
+    let funding_time = parse_millisecond_timestamp(msg.funding_time);
+    let next_funding_time = parse_millisecond_timestamp(msg.next_funding_time);
+    let funding_interval_nanos =
+        next_funding_time
+            .duration_since(&funding_time)
+            .ok_or(anyhow::anyhow!(
+                "Invalid funding_interval, cannot be negative"
+            ))?;
+    let funding_interval = u16::try_from(funding_interval_nanos / 60_000_000_000)
+        .context("funding_interval out of bounds")?;
     let ts_event = parse_millisecond_timestamp(msg.ts);
 
     Ok(FundingRateUpdate::new(
         instrument_id,
         funding_rate,
-        funding_time,
+        Some(funding_interval),
+        Some(funding_time),
         ts_event,
         ts_init,
+    ))
+}
+
+/// Parses a [`OKXFundingRateHistory`] into a [`FundingRateUpdate`].
+///
+/// # Errors
+///
+/// Returns an error if the `funding_rate` field fails
+/// to parse into a Decimal value or `interval_millis` fails to parse into a positive, in bounds interval.
+pub fn parse_funding_rate(
+    raw: &OKXFundingRateHistory,
+    instrument_id: InstrumentId,
+    interval_millis: Option<u64>,
+) -> anyhow::Result<FundingRateUpdate> {
+    let funding_rate =
+        Decimal::from_str(&raw.funding_rate).context("invalid funding_rate value")?;
+    let ts_event = UnixNanos::from(raw.funding_time * NANOSECONDS_IN_MILLISECOND);
+    let interval = interval_millis
+        .map(|ms| u16::try_from(ms / 60_000).context("interval milliseconds out of bounds"))
+        .transpose()?;
+
+    Ok(FundingRateUpdate::new(
+        instrument_id,
+        funding_rate,
+        interval,
+        None,
+        ts_event,
+        ts_event,
     ))
 }
 
@@ -565,7 +621,8 @@ pub fn parse_order_status_report(
             }
         } else {
             log::warn!(
-                "Cannot convert quote quantity without price: ord_id={}, sz={}, px='{}', avg_px='{}', using sz as-is",
+                "Cannot convert quote quantity to base without price, using raw sz: \
+                 ord_id={}, sz={}, px='{}', avg_px='{}'",
                 order.ord_id.as_str(),
                 order.sz,
                 order.px,
@@ -647,6 +704,32 @@ pub fn parse_order_status_report(
             Some(existing) if existing == &algo_client_id => {}
             Some(_) => linked_ids.push(algo_client_id),
             None => client_order_id = Some(algo_client_id),
+        }
+    }
+
+    if let Some(attach_algo_cl_ord_id) = order
+        .attach_algo_cl_ord_id
+        .as_ref()
+        .filter(|value| !value.as_str().is_empty())
+    {
+        let attach_client_id = ClientOrderId::new(attach_algo_cl_ord_id.as_str());
+        match &client_order_id {
+            Some(existing) if existing == &attach_client_id => {}
+            _ if linked_ids.contains(&attach_client_id) => {}
+            _ => linked_ids.push(attach_client_id),
+        }
+    }
+
+    for attach_algo in &order.attach_algo_ords {
+        if attach_algo.attach_algo_cl_ord_id.is_empty() {
+            continue;
+        }
+
+        let attach_client_id = ClientOrderId::new(attach_algo.attach_algo_cl_ord_id.as_str());
+        match &client_order_id {
+            Some(existing) if existing == &attach_client_id => {}
+            _ if linked_ids.contains(&attach_client_id) => {}
+            _ => linked_ids.push(attach_client_id),
         }
     }
 
@@ -862,7 +945,7 @@ pub fn parse_position_status_report(
                 );
             }
 
-            let quantity_dec = pos_dec.abs() / avg_px_dec;
+            let quantity_dec = (pos_dec.abs() / avg_px_dec).round_dp(size_precision as u32);
             (PositionSide::Short, quantity_dec)
         } else {
             anyhow::bail!(
@@ -1952,6 +2035,7 @@ pub fn parse_account_state(
     ts_init: UnixNanos,
 ) -> anyhow::Result<AccountState> {
     let mut balances = Vec::new();
+
     for b in &okx_account.details {
         // Skip balances with empty or whitespace-only currency codes
         let ccy_str = b.ccy.as_str().trim();
@@ -3963,6 +4047,81 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_position_status_report_margin_short_rounds_to_size_precision() {
+        // 100.00 USDT / 3333.33 USDT/ETH = 0.030000030000... ETH
+        // Without round_dp this exceeds size_precision=4 and fails
+        let position = OKXPosition {
+            inst_id: Ustr::from("ETH-USDT"),
+            inst_type: OKXInstrumentType::Margin,
+            mgn_mode: OKXMarginMode::Cross,
+            pos_id: Some(Ustr::from("margin-short-2")),
+            pos_side: OKXPositionSide::Net,
+            pos: "100.00".to_string(),
+            base_bal: "0".to_string(),
+            ccy: "USDT".to_string(),
+            fee: "0".to_string(),
+            lever: "3".to_string(),
+            last: "3333.33".to_string(),
+            mark_px: "3333.33".to_string(),
+            liq_px: "3500".to_string(),
+            mmr: "0.1".to_string(),
+            interest: "0".to_string(),
+            trade_id: Ustr::from("trade-round"),
+            notional_usd: "100.00".to_string(),
+            avg_px: "3333.33".to_string(),
+            upl: "0".to_string(),
+            upl_ratio: "0".to_string(),
+            u_time: 1622559930237,
+            margin: "50".to_string(),
+            mgn_ratio: "0.5".to_string(),
+            adl: "0".to_string(),
+            c_time: "1622559930237".to_string(),
+            realized_pnl: "0".to_string(),
+            upl_last_px: "0".to_string(),
+            upl_ratio_last_px: "0".to_string(),
+            avail_pos: "100.00".to_string(),
+            be_px: "3333.33".to_string(),
+            funding_fee: "0".to_string(),
+            idx_px: "3333.33".to_string(),
+            liq_penalty: "0".to_string(),
+            opt_val: "0".to_string(),
+            pending_close_ord_liab_val: "0".to_string(),
+            pnl: "0".to_string(),
+            pos_ccy: "USDT".to_string(),
+            quote_bal: "100.00".to_string(),
+            quote_borrowed: "0".to_string(),
+            quote_interest: "0".to_string(),
+            spot_in_use_amt: "0".to_string(),
+            spot_in_use_ccy: String::new(),
+            usd_px: "3333.33".to_string(),
+        };
+
+        let report = parse_position_status_report(
+            &position,
+            AccountId::new("OKX-001"),
+            InstrumentId::from("ETH-USDT.OKX"),
+            4, // size_precision=4
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.position_side, PositionSide::Short.as_specified());
+        assert_eq!(report.quantity.to_string(), "0.0300");
+    }
+
+    #[rstest]
+    fn test_parse_rfc3339_timestamp_rejects_pre_epoch() {
+        let result = parse_rfc3339_timestamp("1960-01-01T00:00:00Z");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Negative nanosecond timestamp")
+        );
+    }
+
+    #[rstest]
     fn test_parse_position_status_report_margin_flat() {
         // Test MARGIN flat position: pos_ccy is empty string
         let position = OKXPosition {
@@ -4720,5 +4879,20 @@ mod tests {
         #[case] expected: OrderType,
     ) {
         assert_eq!(determine_order_type(okx_ord_type, price), expected);
+    }
+
+    #[rstest]
+    #[case::option("BTC-USD-250328-92000-C", "BTC-USD")]
+    #[case::swap("BTC-USDT-SWAP", "BTC-USDT")]
+    #[case::futures("ETH-USD-250328", "ETH-USD")]
+    #[case::spot("BTC-USDT", "BTC-USDT")]
+    fn test_extract_inst_family(#[case] symbol: &str, #[case] expected: &str) {
+        let family = extract_inst_family(symbol).unwrap();
+        assert_eq!(family.as_str(), expected);
+    }
+
+    #[rstest]
+    fn test_extract_inst_family_single_segment_fails() {
+        assert!(extract_inst_family("BTC").is_err());
     }
 }

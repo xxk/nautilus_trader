@@ -26,10 +26,9 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use indexmap::IndexMap;
 use nautilus_core::{
-    AtomicTime, UUID4, consts::NAUTILUS_USER_AGENT, datetime::NANOSECONDS_IN_SECOND,
+    AtomicMap, AtomicTime, UUID4, consts::NAUTILUS_USER_AGENT, datetime::NANOSECONDS_IN_SECOND,
     nanos::UnixNanos, time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
@@ -87,9 +86,7 @@ fn compute_time_in_force(
         match time_in_force {
             TimeInForce::Gtc => Ok((None, None)), // Default, no parameter needed
             TimeInForce::Ioc => Ok((Some("IOC".to_string()), None)),
-            TimeInForce::Fok => {
-                anyhow::bail!("FOK time in force not supported by Kraken Spot API")
-            }
+            TimeInForce::Fok => Ok((Some("FOK".to_string()), None)),
             TimeInForce::Gtd => {
                 let expire = expire_time.ok_or_else(|| {
                     anyhow::anyhow!("GTD time in force requires expire_time parameter")
@@ -974,9 +971,13 @@ impl KrakenSpotRawHttpClient {
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.kraken", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.kraken")
+)]
 pub struct KrakenSpotHttpClient {
     pub(crate) inner: Arc<KrakenSpotRawHttpClient>,
-    pub(crate) instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
+    pub(crate) instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
     clock: &'static AtomicTime,
     cache_initialized: Arc<AtomicBool>,
     use_spot_position_reports: Arc<AtomicBool>,
@@ -1044,7 +1045,7 @@ impl KrakenSpotHttpClient {
                 proxy_url,
                 max_requests_per_second,
             )?),
-            instruments_cache: Arc::new(DashMap::new()),
+            instruments_cache: Arc::new(AtomicMap::new()),
             cache_initialized: Arc::new(AtomicBool::new(false)),
             use_spot_position_reports: Arc::new(AtomicBool::new(false)),
             spot_positions_quote_currency: Arc::new(RwLock::new(Ustr::from("USDT"))),
@@ -1079,7 +1080,7 @@ impl KrakenSpotHttpClient {
                 proxy_url,
                 max_requests_per_second,
             )?),
-            instruments_cache: Arc::new(DashMap::new()),
+            instruments_cache: Arc::new(AtomicMap::new()),
             cache_initialized: Arc::new(AtomicBool::new(false)),
             use_spot_position_reports: Arc::new(AtomicBool::new(false)),
             spot_positions_quote_currency: Arc::new(RwLock::new(Ustr::from("USDT"))),
@@ -1151,26 +1152,26 @@ impl KrakenSpotHttpClient {
     }
 
     /// Caches multiple instruments for symbol lookup.
-    pub fn cache_instruments(&self, instruments: Vec<InstrumentAny>) {
-        for instrument in instruments {
-            self.instruments_cache
-                .insert(instrument.symbol().inner(), instrument);
-        }
+    pub fn cache_instruments(&self, instruments: &[InstrumentAny]) {
+        self.instruments_cache.rcu(|m| {
+            for instrument in instruments {
+                m.insert(instrument.symbol().inner(), instrument.clone());
+            }
+        });
         self.cache_initialized.store(true, Ordering::Release);
     }
 
     /// Gets an instrument from the cache by symbol.
     pub fn get_cached_instrument(&self, symbol: &Ustr) -> Option<InstrumentAny> {
-        self.instruments_cache
-            .get(symbol)
-            .map(|entry| entry.value().clone())
+        self.instruments_cache.get_cloned(symbol)
     }
 
     fn get_instrument_by_raw_symbol(&self, raw_symbol: &str) -> Option<InstrumentAny> {
         self.instruments_cache
-            .iter()
-            .find(|entry| entry.value().raw_symbol().as_str() == raw_symbol)
-            .map(|entry| entry.value().clone())
+            .load()
+            .values()
+            .find(|inst| inst.raw_symbol().as_str() == raw_symbol)
+            .cloned()
     }
 
     fn generate_ts_init(&self) -> UnixNanos {
@@ -1627,9 +1628,8 @@ impl KrakenSpotHttpClient {
         } else {
             let quote_filter = *self.spot_positions_quote_currency.read().expect("lock");
 
-            for entry in self.instruments_cache.iter() {
-                let instrument = entry.value();
-
+            let instruments_guard = self.instruments_cache.load();
+            for instrument in instruments_guard.values() {
                 let quote_currency = match instrument.quote_currency() {
                     currency if currency.code == quote_filter => currency,
                     _ => continue,
@@ -1730,12 +1730,16 @@ impl KrakenSpotHttpClient {
             _ => anyhow::bail!("Unsupported order type: {order_type:?}"),
         };
 
-        // Note: timeinforce is only valid for limit-type orders, not market orders
         let mut oflags = Vec::new();
         let is_limit_order = matches!(
             order_type,
             OrderType::Limit | OrderType::StopLimit | OrderType::LimitIfTouched
         );
+
+        // FOK is only valid for plain limit orders, not conditional orders
+        if time_in_force == TimeInForce::Fok && order_type != OrderType::Limit {
+            anyhow::bail!("FOK time in force only supported for LIMIT orders on Kraken Spot");
+        }
 
         let (timeinforce, expiretm) =
             compute_time_in_force(is_limit_order, time_in_force, expire_time)?;
@@ -2030,6 +2034,7 @@ mod tests {
     #[rstest]
     #[case::gtc_limit(true, TimeInForce::Gtc, None, None, None)]
     #[case::ioc_limit(true, TimeInForce::Ioc, None, Some("IOC"), None)]
+    #[case::fok_limit(true, TimeInForce::Fok, None, Some("FOK"), None)]
     #[case::gtd_limit_with_expire(
         true,
         TimeInForce::Gtd,
@@ -2053,7 +2058,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::fok_not_supported(TimeInForce::Fok, None, "FOK")]
     #[case::gtd_missing_expire(TimeInForce::Gtd, None, "expire_time")]
     fn test_compute_time_in_force_errors(
         #[case] tif: TimeInForce,

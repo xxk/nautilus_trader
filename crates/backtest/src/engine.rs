@@ -50,7 +50,7 @@ use nautilus_model::{
     types::{Currency, Money},
 };
 use nautilus_system::{config::NautilusKernelConfig, kernel::NautilusKernel};
-use nautilus_trading::strategy::Strategy;
+use nautilus_trading::{ExecutionAlgorithm, strategy::Strategy};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -435,7 +435,7 @@ impl BacktestEngine {
     /// Returns an error if the algorithm is already registered or the trader is running.
     pub fn add_exec_algorithm<T>(&mut self, exec_algorithm: T) -> anyhow::Result<()>
     where
-        T: DataActor + Component + Debug + 'static,
+        T: ExecutionAlgorithm + Component + Debug + 'static,
     {
         self.kernel.trader.add_exec_algorithm(exec_algorithm)
     }
@@ -752,6 +752,7 @@ impl BacktestEngine {
     /// Dispose of the backtest engine, releasing all resources.
     pub fn dispose(&mut self) {
         self.clear_data();
+        self.accumulator.clear();
         self.kernel.dispose();
     }
 
@@ -805,8 +806,30 @@ impl BacktestEngine {
     }
 
     fn build_analyzer(&self, cache: &Cache, positions: &[&Position]) -> PortfolioAnalyzer {
+        // Position snapshots are stored as concatenated JSON objects in cache bytes.
+        // Decode them into Position entries and merge into analyzer inputs.
+        fn decode_position_snapshots(snapshot_bytes: &[u8]) -> Vec<Position> {
+            serde_json::de::Deserializer::from_slice(snapshot_bytes)
+                .into_iter::<Position>()
+                .filter_map(|result| match result {
+                    Ok(position) => Some(position),
+                    Err(e) => {
+                        log::warn!("Failed to decode position snapshot: {e}");
+                        None
+                    }
+                })
+                .collect()
+        }
+
         let mut analyzer = PortfolioAnalyzer::default();
         let positions_owned: Vec<_> = positions.iter().map(|p| (*p).clone()).collect();
+        let mut snapshot_positions = Vec::new();
+
+        for position in positions {
+            if let Some(snapshot_bytes) = cache.position_snapshot_bytes(&position.id) {
+                snapshot_positions.extend(decode_position_snapshots(&snapshot_bytes));
+            }
+        }
 
         // Aggregate starting and current balances across all venue accounts
         for venue in self.venues.keys() {
@@ -833,6 +856,7 @@ impl BacktestEngine {
         }
 
         analyzer.add_positions(&positions_owned);
+        analyzer.add_positions(&snapshot_positions);
         analyzer
     }
 

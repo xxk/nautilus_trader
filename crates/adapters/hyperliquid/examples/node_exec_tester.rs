@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .with_reconciliation(true)
-        .with_delay_post_stop_secs(5)
+        .with_delay_post_stop_secs(10)
         .build()?;
 
     let order_qty = Quantity::from("0.01"); // Minimum order size for ETH-USD-PERP
@@ -93,8 +93,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tester_config.base.external_order_claims = Some(vec![instrument_id]);
 
-    // Use UUIDs for unique client order IDs across restarts
-    tester_config.base.use_uuid_client_order_ids = true;
     // Hyperliquid supports hyphens in client order IDs (they're hashed to cloid)
     tester_config.base.use_hyphens_in_client_order_ids = true;
 

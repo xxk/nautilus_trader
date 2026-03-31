@@ -1,7 +1,6 @@
 # Data
 
-NautilusTrader provides a set of built-in data types specifically designed to represent a trading domain.
-These data types include:
+NautilusTrader provides built-in data types for the trading domain:
 
 - `OrderBookDelta` (L1/L2/L3): Represents the most granular order book updates.
 - `OrderBookDeltas` (L1/L2/L3): Batches multiple order book deltas for more efficient processing.
@@ -15,9 +14,9 @@ These data types include:
 - `InstrumentStatus`: An instrument-level status event.
 - `InstrumentClose`: The closing price of an instrument.
 
-NautilusTrader is designed primarily to operate on granular order book data, providing the highest realism
-for execution simulations in backtesting.
-However, backtests can also be conducted on any of the supported market data types, depending on the desired simulation fidelity.
+NautilusTrader operates primarily on granular order book data for the highest realism
+in execution simulations. Backtests can also run on any supported market data type,
+depending on the desired simulation fidelity.
 
 ## Order books
 
@@ -537,9 +536,14 @@ The `ts_init` field indicates when the message was originally received.
 
 ## Data flow
 
-The platform ensures consistency by flowing data through the same pathways across all system [environment contexts](architecture.md#environment-contexts)
-(e.g., `backtest`, `sandbox`, `live`). Data is primarily transported via the `MessageBus` to the `DataEngine`
-and then distributed to subscribed or registered handlers.
+From the `DataEngine` onward, data follows the same pathway regardless of
+[environment context](architecture.md#environment-contexts) (backtest, sandbox,
+live). In live and sandbox modes a venue adapter creates a normalized data
+object and sends it through a channel; in backtests the engine feeds data
+directly. Either way the `DataEngine` stores it in the `Cache` (for cached
+types) and publishes it on the `MessageBus` to subscribed handlers.
+For a step-by-step trace with a sequence diagram, see
+[Data flow: life of a quote tick](architecture.md#data-flow-life-of-a-quote-tick).
 
 For users who need more flexibility, the platform also supports the creation of custom data types.
 For details on how to implement user-defined data types, see the [Custom Data](#custom-data) section below.
@@ -823,7 +827,7 @@ catalog = ParquetDataCatalog.from_uri("s3://my-bucket/nautilus-data/")
 # With storage options
 catalog = ParquetDataCatalog.from_uri(
     "s3://my-bucket/nautilus-data/",
-    storage_options={
+    fs_storage_options={
         "access_key_id": "your-key",
         "secret_access_key": "your-secret"
     }

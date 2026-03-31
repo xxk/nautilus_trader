@@ -16,7 +16,7 @@
 //! Live market data client for the Betfair adapter.
 
 use std::sync::{
-    Arc, Mutex, RwLock,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -34,7 +34,7 @@ use nautilus_common::{
     },
     providers::InstrumentProvider,
 };
-use nautilus_core::Params;
+use nautilus_core::{AtomicMap, Params};
 use nautilus_model::{
     data::{CustomData, CustomDataTrait, Data, DataType, OrderBookDeltas_API, TradeTick},
     identifiers::{ClientId, InstrumentId, TradeId, Venue},
@@ -109,7 +109,7 @@ pub struct BetfairDataClient {
     currency: Currency,
     is_connected: AtomicBool,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
-    instruments: Arc<RwLock<AHashMap<InstrumentId, InstrumentAny>>>,
+    instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     subscribed_market_ids: AHashSet<String>,
     keep_alive_handle: Option<JoinHandle<()>>,
     race_fatal_handle: Option<JoinHandle<()>>,
@@ -150,7 +150,7 @@ impl BetfairDataClient {
             currency,
             is_connected: AtomicBool::new(false),
             data_sender,
-            instruments: Arc::new(RwLock::new(AHashMap::new())),
+            instruments: Arc::new(AtomicMap::new()),
             subscribed_market_ids: AHashSet::new(),
             keep_alive_handle: None,
             race_fatal_handle: None,
@@ -159,7 +159,7 @@ impl BetfairDataClient {
 
     fn create_stream_handler(
         data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
-        instruments: Arc<RwLock<AHashMap<InstrumentId, InstrumentAny>>>,
+        instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
         currency: Currency,
         min_notional: Option<Money>,
     ) -> TcpMessageHandler {
@@ -198,24 +198,22 @@ impl BetfairDataClient {
                             if let Some(status) = &def.status {
                                 market_closed = *status == MarketStatus::Closed;
                                 let in_play = def.in_play.unwrap_or(false);
-                                let guard = instruments.read().ok();
-                                if let Some(guard) = &guard {
-                                    for inst in guard.values() {
-                                        let prefix = format!("{}-", mc.id);
-                                        if inst.id().symbol.as_str().starts_with(&prefix) {
-                                            let event = parse_instrument_status(
-                                                inst.id(),
-                                                *status,
-                                                in_play,
-                                                ts_event,
-                                                ts_init,
-                                            );
+                                let guard = instruments.load();
+                                for inst in guard.values() {
+                                    let prefix = format!("{}-", mc.id);
+                                    if inst.id().symbol.as_str().starts_with(&prefix) {
+                                        let event = parse_instrument_status(
+                                            inst.id(),
+                                            *status,
+                                            in_play,
+                                            ts_event,
+                                            ts_init,
+                                        );
 
-                                            if let Err(e) =
-                                                data_sender.send(DataEvent::InstrumentStatus(event))
-                                            {
-                                                log::warn!("Failed to send instrument status: {e}");
-                                            }
+                                        if let Err(e) =
+                                            data_sender.send(DataEvent::InstrumentStatus(event))
+                                        {
+                                            log::warn!("Failed to send instrument status: {e}");
                                         }
                                     }
                                 }
@@ -253,11 +251,11 @@ impl BetfairDataClient {
                                 min_notional,
                             ) {
                                 Ok(new_instruments) => {
-                                    if let Ok(mut guard) = instruments.write() {
+                                    instruments.rcu(|m| {
                                         for inst in &new_instruments {
-                                            guard.insert(inst.id(), inst.clone());
+                                            m.insert(inst.id(), inst.clone());
                                         }
-                                    }
+                                    });
                                     for inst in new_instruments {
                                         if let Err(e) =
                                             data_sender.send(DataEvent::Instrument(inst))
@@ -530,10 +528,9 @@ impl DataClient for BetfairDataClient {
         self.stream_client = None;
         self.race_stream_client = None;
         self.provider.store_mut().clear();
+        self.subscribed_market_ids.clear();
 
-        if let Ok(mut guard) = self.instruments.write() {
-            guard.clear();
-        }
+        self.instruments.store(AHashMap::new());
         Ok(())
     }
 
@@ -572,15 +569,11 @@ impl DataClient for BetfairDataClient {
             .cloned()
             .collect();
 
-        {
-            let mut guard = self
-                .instruments
-                .write()
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.instruments.rcu(|m| {
             for inst in &loaded {
-                guard.insert(inst.id(), inst.clone());
+                m.insert(inst.id(), inst.clone());
             }
-        }
+        });
 
         for inst in &loaded {
             if let Err(e) = self.data_sender.send(DataEvent::Instrument(inst.clone())) {
@@ -677,6 +670,8 @@ impl DataClient for BetfairDataClient {
 
         // Spawn periodic keep-alive to prevent session expiry
         let keep_alive_client = Arc::clone(&self.http_client);
+        let keep_alive_stream = Arc::clone(self.stream_client.as_ref().unwrap());
+        let keep_alive_app_key = self.credential.app_key().to_string();
         self.keep_alive_handle = Some(get_runtime().spawn(async move {
             let interval = tokio::time::Duration::from_secs(KEEP_ALIVE_INTERVAL_SECS);
             loop {
@@ -685,6 +680,9 @@ impl DataClient for BetfairDataClient {
                 if let Err(e) = keep_alive_client.keep_alive().await {
                     log::warn!("Betfair keep-alive failed: {e}");
                 } else {
+                    if let Some(token) = keep_alive_client.session_token().await {
+                        keep_alive_stream.update_auth(&keep_alive_app_key, token);
+                    }
                     log::debug!("Betfair session keep-alive sent");
                 }
             }
@@ -720,6 +718,7 @@ impl DataClient for BetfairDataClient {
 
         self.http_client.disconnect().await;
         self.is_connected.store(false, Ordering::Relaxed);
+        self.subscribed_market_ids.clear();
 
         log::info!("Betfair data client disconnected: {}", self.client_id);
         Ok(())
@@ -729,14 +728,17 @@ impl DataClient for BetfairDataClient {
         let instrument_id = cmd.instrument_id;
         let market_id = extract_market_id(&instrument_id)?;
 
+        if !self.subscribed_market_ids.insert(market_id.clone()) {
+            log::debug!("Book deltas already subscribed for market {market_id}");
+            return Ok(());
+        }
+
         let stream_client = Arc::clone(
             self.stream_client
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Stream client not connected"))?,
         );
 
-        // Accumulate market IDs so each subscription includes all prior markets
-        self.subscribed_market_ids.insert(market_id);
         let all_ids: Vec<String> = self.subscribed_market_ids.iter().cloned().collect();
 
         let market_filter = StreamMarketFilter {
@@ -782,7 +784,7 @@ impl DataClient for BetfairDataClient {
 
     fn subscribe_trades(&mut self, cmd: &SubscribeTrades) -> anyhow::Result<()> {
         // Trades are included in market subscription via EX_TRADED
-        log::info!(
+        log::debug!(
             "Trade data included in book subscription for {}",
             cmd.instrument_id
         );
@@ -802,7 +804,7 @@ impl DataClient for BetfairDataClient {
         cmd: &SubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
         // Instrument status is included in market subscription via EX_MARKET_DEF
-        log::info!(
+        log::debug!(
             "Instrument status included in book subscription for {}",
             cmd.instrument_id
         );

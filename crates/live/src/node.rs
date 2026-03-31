@@ -65,7 +65,7 @@ use nautilus_model::{
     identifiers::{StrategyId, TraderId},
 };
 use nautilus_system::{config::NautilusKernelConfig, kernel::NautilusKernel};
-use nautilus_trading::strategy::Strategy;
+use nautilus_trading::{ExecutionAlgorithm, strategy::Strategy};
 use tabled::{Table, Tabled, settings::Style};
 
 use crate::{
@@ -187,6 +187,10 @@ impl LiveNodeHandle {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", unsendable)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 pub struct LiveNode {
     kernel: NautilusKernel,
@@ -776,6 +780,8 @@ impl LiveNode {
 
         // Running phase: runs until shutdown deadline expires
         let mut residual_events = 0usize;
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
 
         loop {
             let shutdown_deadline = self.shutdown_deadline;
@@ -783,6 +789,67 @@ impl LiveNode {
             let is_running = self.state() == NodeState::Running;
 
             tokio::select! {
+                biased;
+
+                // Signal branches first so they are always checked
+                result = &mut ctrl_c, if is_running => {
+                    match result {
+                        Ok(()) => log::info!("Received SIGINT, shutting down"),
+                        Err(e) => log::error!("Failed to listen for SIGINT: {e}"),
+                    }
+                    self.initiate_shutdown();
+                }
+                () = async {
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                        if stop_handle.should_stop() {
+                            log::info!("Received stop signal from handle");
+                            return;
+                        }
+                    }
+                }, if is_running => {
+                    self.initiate_shutdown();
+                }
+                () = async {
+                    match shutdown_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if self.state() == NodeState::ShuttingDown => {
+                    break;
+                }
+
+                // Housekeeping timers (before event processing to avoid starvation)
+                _ = recon_timer.tick(), if is_running && recon_enabled => {
+                    if let Err(e) = self.run_reconciliation_checks(
+                        inflight_interval_ns,
+                        open_interval_ns,
+                        position_interval_ns,
+                        &mut ts_last_inflight,
+                        &mut ts_last_open,
+                        &mut ts_last_position,
+                    ).await {
+                        log::error!("Reconciliation check error: {e}");
+                    }
+                }
+                _ = purge_orders_timer.tick(), if is_running => {
+                    self.exec_manager.purge_closed_orders();
+                }
+                _ = purge_positions_timer.tick(), if is_running => {
+                    self.exec_manager.purge_closed_positions();
+                }
+                _ = purge_account_timer.tick(), if is_running => {
+                    self.exec_manager.purge_account_events();
+                }
+                _ = own_books_timer.tick(), if is_running => {
+                    self.kernel.cache().borrow_mut().audit_own_order_books();
+                }
+                _ = prune_fills_timer.tick(), if is_running => {
+                    self.exec_manager.prune_recent_fills_cache(60.0);
+                }
+
+                // Event processing branches
                 Some(handler) = time_evt_rx.recv() => {
                     AsyncRunner::handle_time_event(handler);
 
@@ -829,60 +896,6 @@ impl LiveNode {
                         residual_events += 1;
                     }
                     AsyncRunner::handle_exec_command(cmd);
-                }
-                result = tokio::signal::ctrl_c(), if is_running => {
-                    match result {
-                        Ok(()) => log::info!("Received SIGINT, shutting down"),
-                        Err(e) => log::error!("Failed to listen for SIGINT: {e}"),
-                    }
-                    self.initiate_shutdown();
-                }
-                () = async {
-                    loop {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-                        if stop_handle.should_stop() {
-                            log::info!("Received stop signal from handle");
-                            return;
-                        }
-                    }
-                }, if is_running => {
-                    self.initiate_shutdown();
-                }
-                () = async {
-                    match shutdown_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                }, if self.state() == NodeState::ShuttingDown => {
-                    break;
-                }
-                _ = recon_timer.tick(), if is_running && recon_enabled => {
-                    if let Err(e) = self.run_reconciliation_checks(
-                        inflight_interval_ns,
-                        open_interval_ns,
-                        position_interval_ns,
-                        &mut ts_last_inflight,
-                        &mut ts_last_open,
-                        &mut ts_last_position,
-                    ).await {
-                        log::error!("Reconciliation check error: {e}");
-                    }
-                }
-                _ = purge_orders_timer.tick(), if is_running => {
-                    self.exec_manager.purge_closed_orders();
-                }
-                _ = purge_positions_timer.tick(), if is_running => {
-                    self.exec_manager.purge_closed_positions();
-                }
-                _ = purge_account_timer.tick(), if is_running => {
-                    self.exec_manager.purge_account_events();
-                }
-                _ = own_books_timer.tick(), if is_running => {
-                    self.kernel.cache().borrow_mut().audit_own_order_books();
-                }
-                _ = prune_fills_timer.tick(), if is_running => {
-                    self.exec_manager.prune_recent_fills_cache(60.0);
                 }
             }
         }
@@ -1161,6 +1174,29 @@ impl LiveNode {
         }
 
         self.kernel.trader.add_strategy(strategy)
+    }
+
+    /// Adds an execution algorithm to the trader.
+    ///
+    /// Execution algorithms are registered in both the component registry (for lifecycle
+    /// management) and the actor registry (for data callbacks via msgbus).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The node is currently running.
+    /// - An execution algorithm with the same ID is already registered.
+    pub fn add_exec_algorithm<T>(&mut self, exec_algorithm: T) -> anyhow::Result<()>
+    where
+        T: ExecutionAlgorithm + Component + Debug + 'static,
+    {
+        if self.state() != NodeState::Idle {
+            anyhow::bail!(
+                "Cannot add exec algorithm while node is running, add exec algorithms before calling start()"
+            );
+        }
+
+        self.kernel.trader.add_exec_algorithm(exec_algorithm)
     }
 
     // Runs up to three reconciliation sub-checks (inflight, open orders,

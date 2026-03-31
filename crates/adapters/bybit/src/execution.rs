@@ -289,6 +289,9 @@ impl ExecutionClient for BybitExecutionClient {
             return Ok(());
         }
 
+        // Reset after a prior disconnect so REST calls are not short-circuited
+        self.http_client.reset_cancellation_token();
+
         let product_types = self.product_types();
 
         if !self.core.instruments_initialized() {
@@ -309,7 +312,7 @@ impl ExecutionClient for BybitExecutionClient {
 
                 log::info!("Loaded {} {product_type:?} instruments", instruments.len());
 
-                self.http_client.cache_instruments(instruments.clone());
+                self.http_client.cache_instruments(&instruments);
                 all_instruments.extend(instruments);
             }
 
@@ -485,7 +488,7 @@ impl ExecutionClient for BybitExecutionClient {
                             log::warn!("No instruments returned for {product_type:?}");
                             continue;
                         }
-                        http_client.cache_instruments(instruments.clone());
+                        http_client.cache_instruments(&instruments);
                         all_instruments.extend(instruments);
                     }
                     Err(e) => {

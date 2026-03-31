@@ -39,7 +39,7 @@ from nautilus_trader.core.datetime import min_date
 from nautilus_trader.core.datetime import time_object_to_dt
 from nautilus_trader.data.config import DataEngineConfig
 from nautilus_trader.model.enums import RecordFlag
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from nautilus_trader.persistence.catalog import BaseDataCatalog
 from nautilus_trader.persistence.funcs import parse_filters_expr
 
 from cpython.datetime cimport datetime
@@ -201,7 +201,7 @@ cdef class DataEngine(Component):
         self._routing_map: dict[Venue, DataClient] = {}
         self._default_client: DataClient | None = None
         self._external_clients: set[ClientId] = set()
-        self._catalogs: dict[str, ParquetDataCatalog] = {}
+        self._catalogs: dict[str, BaseDataCatalog] = {}
         self._order_book_intervals: dict[tuple[InstrumentId, int], list[Callable[[OrderBook], None]]] = {}
         self._bar_aggregators: dict[tuple[BarType, UUID4], BarAggregator] = {}
         self._spread_quote_aggregators: dict[tuple[InstrumentId, UUID4], SpreadQuoteAggregator] = {}
@@ -375,13 +375,13 @@ cdef class DataEngine(Component):
 
 # --REGISTRATION ----------------------------------------------------------------------------------
 
-    def register_catalog(self, catalog: ParquetDataCatalog, name: str = "catalog_0") -> None:
+    def register_catalog(self, catalog: BaseDataCatalog, name: str = "catalog_0") -> None:
         """
         Register the given data catalog with the engine.
 
         Parameters
         ----------
-        catalog : ParquetDataCatalog
+        catalog : BaseDataCatalog
             The data catalog to register.
         name : str, default 'catalog_0'
             The name of the catalog to register.
@@ -1352,6 +1352,17 @@ cdef class DataEngine(Component):
                         ts_init=self._clock.timestamp_ns(),
                     ),
                 )
+            # Subscribe instrument status
+            if cython_id not in client.subscribed_instrument_status():
+                client.subscribe_instrument_status(
+                    SubscribeInstrumentStatus(
+                        client_id=command.client_id,
+                        venue=command.venue,
+                        instrument_id=cython_id,
+                        command_id=UUID4(),
+                        ts_init=self._clock.timestamp_ns(),
+                    ),
+                )
 
     cdef void _unsubscribe_option_chain_instruments(
         self,
@@ -1375,6 +1386,16 @@ cdef class DataEngine(Component):
             if cython_id in client.subscribed_option_greeks():
                 client.unsubscribe_option_greeks(
                     UnsubscribeOptionGreeks(
+                        instrument_id=cython_id,
+                        client_id=client.id,
+                        venue=client.venue,
+                        command_id=UUID4(),
+                        ts_init=ts,
+                    ),
+                )
+            if cython_id in client.subscribed_instrument_status():
+                client.unsubscribe_instrument_status(
+                    UnsubscribeInstrumentStatus(
                         instrument_id=cython_id,
                         client_id=client.id,
                         venue=client.venue,
@@ -1580,6 +1601,10 @@ cdef class DataEngine(Component):
         """Timer callback to publish option chain snapshots."""
         cdef str timer_name = event.name
         cdef str series_key = None
+        cdef uint64_t ts_ns
+        cdef uint64_t expiration_ns
+        cdef Venue venue
+        cdef MarketDataClient client
 
         # Find series key from timer name
         for sk, tn in self._option_chain_timer_names.items():
@@ -1594,7 +1619,18 @@ cdef class DataEngine(Component):
         if manager is None:
             return
 
-        cdef uint64_t ts_ns = self._clock.timestamp_ns()
+        ts_ns = self._clock.timestamp_ns()
+
+        # Safeguard: proactively teardown expired series
+        expiration_ns = manager.series_id.expiration_ns
+        if ts_ns >= expiration_ns:
+            self._log.warning(
+                f"Option chain {series_key} expired at {expiration_ns}, tearing down",
+            )
+            venue = Venue(str(manager.series_id.venue))
+            client = self._routing_map.get(venue)
+            self._teardown_option_chain(series_key, client)
+            return
 
         # Check rebalance and forward subscribe/unsubscribe for changed instruments
         rebalance = manager.check_rebalance(ts_ns)
@@ -2741,6 +2777,15 @@ cdef class DataEngine(Component):
         manager = self._option_chain_managers.get(series_key)
         if manager is None:
             return
+
+        # Safeguard: reject data past expiry
+        if tick.ts_event >= manager.series_id.expiration_ns:
+            self._log.warning(
+                f"Dropping quote for {tick.instrument_id}, series {series_key} expired",
+            )
+            self._expire_option_chain_instrument(tick.instrument_id, series_key)
+            return
+
         try:
             pyo3_tick = tick.to_pyo3()
             bootstrapped = manager.handle_quote(pyo3_tick)
@@ -2762,6 +2807,15 @@ cdef class DataEngine(Component):
         manager = self._option_chain_managers.get(series_key)
         if manager is None:
             return
+
+        # Safeguard: reject data past expiry
+        if option_greeks.ts_event >= manager.series_id.expiration_ns:
+            self._log.warning(
+                f"Dropping greeks for {option_greeks.instrument_id}, series {series_key} expired",
+            )
+            self._expire_option_chain_instrument(option_greeks.instrument_id, series_key)
+            return
+
         try:
             pyo3_greeks = option_greeks.to_pyo3()
             bootstrapped = manager.handle_greeks(pyo3_greeks)
@@ -3051,12 +3105,13 @@ cdef class DataEngine(Component):
             self._log.warning("No catalog available for appending data.")
             return
 
-        if len(data) == 0 and data_cls and start and end:
-            # identifier can be None for custom data
-            used_catalog.extend_file_name(data_cls, identifier, start, end)
-            return
-
-        used_catalog.write_data(data, start, end)
+        used_catalog.write_data(
+            data,
+            start,
+            end,
+            data_cls=data_cls,
+            identifier=str(identifier) if identifier is not None else None,
+        )
 
     cpdef tuple[datetime, object] _catalog_last_timestamp(
         self,
@@ -3809,6 +3864,8 @@ cdef class DataEngine(Component):
         key = self._get_spread_quote_aggregator_key(spread_instrument_id, used_request_id)
         aggregator = self._spread_quote_aggregators.get(key)
         if aggregator:
+            aggregator.flush_pending_historical_quotes()
+
             # After a request we set is_running to False so a request using the same aggregator
             # or a subscription can use the aggregator
             aggregator.set_running(False)

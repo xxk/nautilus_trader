@@ -24,7 +24,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ahash::AHashSet;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
@@ -39,24 +38,28 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    MUTEX_POISONED, UUID4, UnixNanos,
+    AtomicSet, MUTEX_POISONED, UUID4, UnixNanos,
+    datetime::{NANOSECONDS_IN_MILLISECOND, mins_to_nanos},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{OmsType, OrderSide, PositionSideSpecified},
+    enums::{
+        LiquiditySide, OmsType, OrderSide, OrderType, PositionSideSpecified, TrailingOffsetType,
+        TriggerType,
+    },
     events::{
-        AccountState, OrderCancelRejected, OrderCanceled, OrderEventAny, OrderModifyRejected,
-        OrderRejected, OrderUpdated,
+        AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderEventAny,
+        OrderFilled, OrderModifyRejected, OrderRejected, OrderUpdated,
     },
     identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
+        AccountId, ClientId, ClientOrderId, InstrumentId, Symbol, TradeId, Venue, VenueOrderId,
     },
     instruments::Instrument,
-    orders::{Order, OrderAny},
+    orders::Order,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Currency, MarginBalance, Money, Quantity},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
@@ -65,7 +68,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     http::{
         BinanceFuturesHttpError,
-        client::{BinanceFuturesHttpClient, BinanceFuturesInstrument, is_algo_order_type},
+        client::{BinanceFuturesHttpClient, is_algo_order_type},
         models::{BatchOrderResult, BinancePositionRisk},
         query::{
             BatchCancelItem, BinanceAllOrdersParamsBuilder, BinanceOpenOrdersParamsBuilder,
@@ -74,20 +77,46 @@ use super::{
         },
     },
     websocket::{
-        client::BinanceFuturesWebSocketClient,
-        handler_exec::BinanceFuturesExecWsFeedHandler,
-        messages::{ExecHandlerCommand, NautilusExecWsMessage},
+        streams::{
+            client::BinanceFuturesWebSocketClient,
+            messages::{BinanceExecutionType, BinanceFuturesWsStreamsMessage},
+            parse_exec::{
+                decode_algo_client_id, parse_futures_account_update,
+                parse_futures_algo_update_to_order_status, parse_futures_order_update_to_fill,
+                parse_futures_order_update_to_order_status,
+            },
+        },
+        trading::{
+            client::BinanceFuturesWsTradingClient, messages::BinanceFuturesWsTradingMessage,
+        },
     },
 };
 use crate::{
     common::{
-        consts::{BINANCE_NAUTILUS_FUTURES_BROKER_ID, BINANCE_VENUE},
+        consts::{
+            BINANCE_FUTURES_USD_WS_API_TESTNET_URL, BINANCE_FUTURES_USD_WS_API_URL,
+            BINANCE_GTX_ORDER_REJECT_CODE, BINANCE_NAUTILUS_FUTURES_BROKER_ID, BINANCE_VENUE,
+        },
         credential::resolve_credentials,
-        encoder::encode_broker_id,
-        enums::{BinancePositionSide, BinanceProductType},
+        dispatch::{
+            OrderIdentity, PendingOperation, PendingRequest, WsDispatchState,
+            ensure_accepted_emitted,
+        },
+        encoder::{decode_broker_id, encode_broker_id},
+        enums::{
+            BinanceEnvironment, BinancePositionSide, BinanceProductType, BinanceSide,
+            BinanceTimeInForce, BinanceWorkingType,
+        },
+        symbol::format_binance_symbol,
     },
     config::BinanceExecClientConfig,
-    futures::http::models::BinanceFuturesAccountInfo,
+    futures::http::{
+        client::order_type_to_binance_futures,
+        models::BinanceFuturesAccountInfo,
+        query::{
+            BinanceCancelOrderParamsBuilder, BinanceModifyOrderParamsBuilder, BinanceNewOrderParams,
+        },
+    },
 };
 
 /// Listen key keepalive interval (30 minutes).
@@ -107,14 +136,16 @@ pub struct BinanceFuturesExecutionClient {
     clock: &'static AtomicTime,
     config: BinanceExecClientConfig,
     emitter: ExecutionEventEmitter,
+    dispatch_state: Arc<WsDispatchState>,
     product_type: BinanceProductType,
     http_client: BinanceFuturesHttpClient,
     ws_client: Option<BinanceFuturesWebSocketClient>,
-    exec_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<ExecHandlerCommand>>,
+    ws_trading_client: Option<BinanceFuturesWsTradingClient>,
+    ws_trading_handle: Mutex<Option<JoinHandle<()>>>,
     listen_key: Arc<RwLock<Option<String>>>,
     cancellation_token: CancellationToken,
-    handler_signal: Arc<AtomicBool>,
-    triggered_algo_order_ids: Arc<RwLock<AHashSet<ClientOrderId>>>,
+    triggered_algo_order_ids: Arc<AtomicSet<ClientOrderId>>,
+    algo_client_order_ids: Arc<AtomicSet<ClientOrderId>>,
     ws_task: Mutex<Option<JoinHandle<()>>>,
     keepalive_task: Mutex<Option<JoinHandle<()>>>,
     pending_tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -157,6 +188,29 @@ impl BinanceFuturesExecutionClient {
         )
         .context("failed to construct Binance Futures HTTP client")?;
 
+        let ws_trading_client = if config.use_ws_trading && product_type == BinanceProductType::UsdM
+        {
+            let ws_trading_url =
+                config
+                    .base_url_ws_trading
+                    .clone()
+                    .or_else(|| match config.environment {
+                        BinanceEnvironment::Testnet => {
+                            Some(BINANCE_FUTURES_USD_WS_API_TESTNET_URL.to_string())
+                        }
+                        _ => Some(BINANCE_FUTURES_USD_WS_API_URL.to_string()),
+                    });
+
+            Some(BinanceFuturesWsTradingClient::new(
+                ws_trading_url,
+                api_key.clone(),
+                api_secret.clone(),
+                None, // heartbeat
+            ))
+        } else {
+            None
+        };
+
         let ws_client = BinanceFuturesWebSocketClient::new(
             product_type,
             config.environment,
@@ -166,6 +220,7 @@ impl BinanceFuturesExecutionClient {
             Some(20), // Heartbeat interval
         )
         .context("failed to construct Binance Futures WebSocket client")?;
+
         let emitter = ExecutionEventEmitter::new(
             clock,
             core.trader_id,
@@ -179,14 +234,16 @@ impl BinanceFuturesExecutionClient {
             clock,
             config,
             emitter,
+            dispatch_state: Arc::new(WsDispatchState::default()),
             product_type,
             http_client,
             ws_client: Some(ws_client),
-            exec_cmd_tx: None,
+            ws_trading_client,
+            ws_trading_handle: Mutex::new(None),
             listen_key: Arc::new(RwLock::new(None)),
             cancellation_token: CancellationToken::new(),
-            handler_signal: Arc::new(AtomicBool::new(false)),
-            triggered_algo_order_ids: Arc::new(RwLock::new(AHashSet::new())),
+            triggered_algo_order_ids: Arc::new(AtomicSet::new()),
+            algo_client_order_ids: Arc::new(AtomicSet::new()),
             ws_task: Mutex::new(None),
             keepalive_task: Mutex::new(None),
             pending_tasks: Mutex::new(Vec::new()),
@@ -253,9 +310,32 @@ impl BinanceFuturesExecutionClient {
             })
             .collect();
 
-        // Margin balances in futures are position-specific, not account-level,
-        // so we don't create MarginBalance entries here as they require instrument_id.
-        let margins: Vec<MarginBalance> = Vec::new();
+        let mut margins: Vec<MarginBalance> = Vec::new();
+
+        let initial_margin_dec = account_info
+            .total_initial_margin
+            .as_ref()
+            .and_then(|s| Decimal::from_str_exact(s).ok());
+        let maint_margin_dec = account_info
+            .total_maint_margin
+            .as_ref()
+            .and_then(|s| Decimal::from_str_exact(s).ok());
+
+        if let (Some(initial_dec), Some(maint_dec)) = (initial_margin_dec, maint_margin_dec)
+            && (!initial_dec.is_zero() || !maint_dec.is_zero())
+        {
+            let margin_currency = Currency::USDT();
+            let margin_instrument_id = InstrumentId::new(Symbol::new("ACCOUNT"), *BINANCE_VENUE);
+            let initial_margin = Money::from_decimal(initial_dec, margin_currency)
+                .unwrap_or_else(|_| Money::zero(margin_currency));
+            let maintenance_margin = Money::from_decimal(maint_dec, margin_currency)
+                .unwrap_or_else(|_| Money::zero(margin_currency));
+            margins.push(MarginBalance::new(
+                initial_margin,
+                maintenance_margin,
+                margin_instrument_id,
+            ));
+        }
 
         AccountState::new(
             self.core.account_id,
@@ -301,91 +381,20 @@ impl BinanceFuturesExecutionClient {
         Ok(response.dual_side_position)
     }
 
-    /// Handles execution events from the handler.
-    ///
-    /// The handler has already correlated WebSocket updates with order context
-    /// (strategy_id, etc.) and emits normalized Nautilus events.
-    fn handle_exec_event(message: NautilusExecWsMessage, emitter: &ExecutionEventEmitter) {
-        match message {
-            NautilusExecWsMessage::OrderAccepted(event) => {
-                emitter.send_order_event(OrderEventAny::Accepted(event));
-            }
-            NautilusExecWsMessage::OrderCanceled(event) => {
-                emitter.send_order_event(OrderEventAny::Canceled(event));
-            }
-            NautilusExecWsMessage::OrderRejected(event) => {
-                emitter.send_order_event(OrderEventAny::Rejected(event));
-            }
-            NautilusExecWsMessage::OrderFilled(event) => {
-                emitter.send_order_event(OrderEventAny::Filled(event));
-            }
-            NautilusExecWsMessage::OrderUpdated(event) => {
-                emitter.send_order_event(OrderEventAny::Updated(event));
-            }
-            NautilusExecWsMessage::AccountUpdate(event) => {
-                emitter.send_account_state(event);
-            }
-            NautilusExecWsMessage::ListenKeyExpired => {
-                log::warn!("Listen key expired - reconnection required");
-            }
-            NautilusExecWsMessage::Reconnected => {
-                log::info!("User data stream WebSocket reconnected");
-            }
-        }
-    }
-
-    /// Registers an order with the execution handler for context tracking.
-    fn register_order(&self, order: &OrderAny) {
-        if let Some(ref cmd_tx) = self.exec_cmd_tx {
-            let cmd = ExecHandlerCommand::RegisterOrder {
-                client_order_id: order.client_order_id(),
-                trader_id: order.trader_id(),
-                strategy_id: order.strategy_id(),
-                instrument_id: order.instrument_id(),
-            };
-
-            if let Err(e) = cmd_tx.send(cmd) {
-                log::error!("Failed to register order with handler: {e}");
-            }
-        }
-    }
-
-    /// Registers a cancel request with the execution handler for context tracking.
-    fn register_cancel(
-        &self,
-        client_order_id: ClientOrderId,
-        trader_id: TraderId,
-        strategy_id: StrategyId,
-        instrument_id: InstrumentId,
-        venue_order_id: Option<VenueOrderId>,
-    ) {
-        if let Some(ref cmd_tx) = self.exec_cmd_tx {
-            let cmd = ExecHandlerCommand::RegisterCancel {
-                client_order_id,
-                trader_id,
-                strategy_id,
-                instrument_id,
-                venue_order_id,
-            };
-
-            if let Err(e) = cmd_tx.send(cmd) {
-                log::error!("Failed to register cancel with handler: {e}");
-            }
-        }
+    /// Returns whether the WS trading client is connected and active.
+    fn ws_trading_active(&self) -> bool {
+        self.ws_trading_client
+            .as_ref()
+            .is_some_and(|c| c.is_active())
     }
 
     fn submit_order_internal(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
-        let http_client = self.http_client.clone();
-
         let order = self
             .core
             .cache()
             .order(&cmd.client_order_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
-
-        // Register order with handler for context tracking before HTTP request
-        self.register_order(&order);
 
         let emitter = self.emitter.clone();
         let trader_id = self.core.trader_id;
@@ -402,11 +411,144 @@ impl BinanceFuturesExecutionClient {
         let trigger_price = order.trigger_price();
         let reduce_only = order.is_reduce_only();
         let post_only = order.is_post_only();
+        let activation_price = order.activation_price();
+        let trailing_offset = order.trailing_offset();
+        let trigger_type = order.trigger_type();
         let position_side = self.determine_position_side(order_side, reduce_only);
 
-        // HTTP only generates OrderRejected on failure.
-        // OrderAccepted comes from WebSocket (ORDER_TRADE_UPDATE or ALGO_UPDATE).
+        // Register identity for tracked/external dispatch routing
+        self.dispatch_state.order_identities.insert(
+            client_order_id,
+            OrderIdentity {
+                instrument_id,
+                strategy_id,
+                order_side,
+                order_type,
+            },
+        );
+
         let use_algo_api = is_algo_order_type(order_type);
+
+        let close_position = cmd
+            .params
+            .as_ref()
+            .and_then(|p| p.get_bool("close_position"))
+            .unwrap_or(false);
+
+        // Convert trailing offset (basis points) to Binance callback rate (percentage).
+        // Binance accepts 1 decimal place (0.1% granularity = 10 bp increments).
+        let callback_rate = trailing_offset
+            .map(|offset| {
+                let rate = offset / rust_decimal::Decimal::ONE_HUNDRED;
+                let rounded = rate.round_dp(1);
+                if rounded != rate {
+                    anyhow::bail!(
+                        "Trailing offset {offset} bp is not a multiple of 10 bp \
+                         (Binance requires 0.1% granularity)"
+                    );
+                }
+                Ok(rounded.to_string())
+            })
+            .transpose()?;
+
+        let working_type = match trigger_type {
+            Some(TriggerType::MarkPrice) => Some(BinanceWorkingType::MarkPrice),
+            Some(TriggerType::LastPrice | TriggerType::Default) => {
+                Some(BinanceWorkingType::ContractPrice)
+            }
+            _ => None,
+        };
+
+        // Non-algo orders can route through WS trading API when active
+        if self.ws_trading_active() && !use_algo_api {
+            let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
+            let dispatch_state = self.dispatch_state.clone();
+            let ts_init = clock.get_time_ns();
+
+            let symbol = format_binance_symbol(&instrument_id);
+            let binance_side = BinanceSide::try_from(order_side)?;
+            let binance_order_type = order_type_to_binance_futures(order_type)?;
+            let binance_tif = if post_only {
+                BinanceTimeInForce::Gtx
+            } else {
+                BinanceTimeInForce::try_from(time_in_force)?
+            };
+
+            let requires_time_in_force = matches!(
+                order_type,
+                OrderType::Limit | OrderType::StopLimit | OrderType::LimitIfTouched
+            );
+
+            let client_id_str =
+                encode_broker_id(&client_order_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID);
+
+            let params = BinanceNewOrderParams {
+                symbol,
+                side: binance_side,
+                order_type: binance_order_type,
+                time_in_force: if requires_time_in_force {
+                    Some(binance_tif)
+                } else {
+                    None
+                },
+                quantity: Some(quantity.to_string()),
+                price: price.map(|p| p.to_string()),
+                new_client_order_id: Some(client_id_str),
+                stop_price: trigger_price.map(|p| p.to_string()),
+                reduce_only: if reduce_only { Some(true) } else { None },
+                position_side,
+                close_position: None,
+                activation_price: activation_price.map(|p| p.to_string()),
+                callback_rate,
+                working_type,
+                price_protect: None,
+                new_order_resp_type: None,
+                good_till_date: None,
+                recv_window: None,
+                price_match: None,
+                self_trade_prevention_mode: None,
+            };
+
+            // Pre-register before sending to avoid response racing the insert
+            let request_id = ws_client.next_request_id();
+            dispatch_state.pending_requests.insert(
+                request_id.clone(),
+                PendingRequest {
+                    client_order_id,
+                    venue_order_id: None,
+                    operation: PendingOperation::Place,
+                },
+            );
+
+            self.spawn_task("submit_order_ws", async move {
+                if let Err(e) = ws_client
+                    .place_order_with_id(request_id.clone(), params)
+                    .await
+                {
+                    dispatch_state.pending_requests.remove(&request_id);
+                    let rejected = OrderRejected::new(
+                        trader_id,
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        account_id,
+                        format!("ws-submit-order-error: {e}").into(),
+                        UUID4::new(),
+                        ts_init,
+                        clock.get_time_ns(),
+                        false,
+                        false,
+                    );
+                    emitter.send_order_event(OrderEventAny::Rejected(rejected));
+                    anyhow::bail!("WS submit order failed: {e}");
+                }
+                Ok(())
+            });
+
+            return Ok(());
+        }
+
+        let http_client = self.http_client.clone();
 
         self.spawn_task("submit_order", async move {
             let result = if use_algo_api {
@@ -422,7 +564,11 @@ impl BinanceFuturesExecutionClient {
                         price,
                         trigger_price,
                         reduce_only,
+                        close_position,
                         position_side,
+                        activation_price,
+                        callback_rate,
+                        working_type,
                     )
                     .await
             } else {
@@ -456,6 +602,15 @@ impl BinanceFuturesExecutionClient {
                     // Keep order registered - if HTTP failed due to timeout but order
                     // reached Binance, WebSocket updates will still arrive. The order
                     // will be cleaned up via WebSocket rejection or reconciliation.
+                    let due_post_only =
+                        e.downcast_ref::<BinanceFuturesHttpError>()
+                            .is_some_and(|be| {
+                                matches!(
+                                    be,
+                                    BinanceFuturesHttpError::BinanceError { code, .. }
+                                        if *code == BINANCE_GTX_ORDER_REJECT_CODE
+                                )
+                            });
                     let ts_now = clock.get_time_ns();
                     let rejected_event = OrderRejected::new(
                         trader_id,
@@ -468,7 +623,7 @@ impl BinanceFuturesExecutionClient {
                         ts_now,
                         ts_now,
                         false,
-                        false,
+                        due_post_only,
                     );
 
                     emitter.send_order_event(OrderEventAny::Rejected(rejected_event));
@@ -484,17 +639,7 @@ impl BinanceFuturesExecutionClient {
     }
 
     fn cancel_order_internal(&self, cmd: &CancelOrder) {
-        let http_client = self.http_client.clone();
         let command = cmd.clone();
-
-        // Register cancel with handler for context tracking before HTTP request
-        self.register_cancel(
-            command.client_order_id,
-            self.core.trader_id,
-            command.strategy_id,
-            command.instrument_id,
-            command.venue_order_id,
-        );
 
         // Non-triggered algo orders use algo cancel endpoint, triggered use regular
         let is_algo = self
@@ -504,8 +649,6 @@ impl BinanceFuturesExecutionClient {
             .is_some_and(|order| is_algo_order_type(order.order_type()));
         let is_triggered = self
             .triggered_algo_order_ids
-            .read()
-            .expect("triggered_algo_order_ids lock poisoned")
             .contains(&command.client_order_id);
         let use_algo_cancel = is_algo && !is_triggered;
 
@@ -517,8 +660,69 @@ impl BinanceFuturesExecutionClient {
         let venue_order_id = command.venue_order_id;
         let client_order_id = command.client_order_id;
 
-        // HTTP only generates OrderCancelRejected on failure.
-        // OrderCanceled comes from WebSocket (ORDER_TRADE_UPDATE or ALGO_UPDATE).
+        // Non-algo cancels can route through WS trading API when active
+        if self.ws_trading_active() && !use_algo_cancel {
+            let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
+            let dispatch_state = self.dispatch_state.clone();
+
+            let mut cancel_builder = BinanceCancelOrderParamsBuilder::default();
+            cancel_builder.symbol(instrument_id.symbol.to_string());
+
+            if let Some(venue_id) = venue_order_id {
+                cancel_builder.order_id(
+                    venue_id
+                        .inner()
+                        .parse::<i64>()
+                        .expect("venue_order_id should be numeric"),
+                );
+            }
+
+            cancel_builder.orig_client_order_id(encode_broker_id(
+                &client_order_id,
+                BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+            ));
+
+            let params = cancel_builder.build().expect("valid cancel params");
+
+            self.spawn_task("cancel_order_ws", async move {
+                match ws_client.cancel_order(params).await {
+                    Ok(request_id) => {
+                        dispatch_state.pending_requests.insert(
+                            request_id,
+                            PendingRequest {
+                                client_order_id,
+                                venue_order_id,
+                                operation: PendingOperation::Cancel,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        let ts_now = clock.get_time_ns();
+                        let rejected = OrderCancelRejected::new(
+                            trader_id,
+                            command.strategy_id,
+                            command.instrument_id,
+                            client_order_id,
+                            format!("ws-cancel-order-error: {e}").into(),
+                            UUID4::new(),
+                            ts_now,
+                            ts_now,
+                            false,
+                            command.venue_order_id,
+                            Some(account_id),
+                        );
+                        emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
+                        anyhow::bail!("WS cancel order failed: {e}");
+                    }
+                }
+                Ok(())
+            });
+
+            return;
+        }
+
+        let http_client = self.http_client.clone();
+
         self.spawn_task("cancel_order", async move {
             let result = if use_algo_cancel {
                 // Try algo cancel first; if it fails, the order may have been triggered
@@ -766,83 +970,40 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                 .map_err(|e| anyhow::anyhow!("failed to subscribe to user data stream: {e}"))?;
             log::info!("Subscribed to user data stream");
 
-            // Create channels for the execution handler
-            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Store command channel for order registration
-            self.exec_cmd_tx = Some(cmd_tx.clone());
-
-            // Create and initialize the execution handler
-            let mut handler = BinanceFuturesExecWsFeedHandler::new(
-                self.clock,
-                self.core.trader_id,
-                self.core.account_id,
-                self.core.account_type,
-                self.product_type,
-                self.handler_signal.clone(),
-                self.triggered_algo_order_ids.clone(),
-                cmd_rx,
-                raw_rx,
-            );
-
-            // Initialize handler with instruments
-            let instruments_for_handler: Vec<BinanceFuturesInstrument> = self
-                .http_client
-                .instruments_cache()
-                .iter()
-                .map(|r| r.value().clone())
-                .collect();
-
-            if let Err(e) = cmd_tx.send(ExecHandlerCommand::InitializeInstruments(
-                instruments_for_handler,
-            )) {
-                log::error!("Failed to send instruments to handler: {e}");
-            }
-
-            // Set up raw message forwarding from WebSocket to handler
             let stream = ws_client.stream();
+            let emitter = self.emitter.clone();
+            let http_client = self.http_client.clone();
+            let account_id = self.core.account_id;
+            let clock = self.clock;
+            let product_type = self.product_type;
+            let dispatch_state = self.dispatch_state.clone();
+            let triggered_algo_ids = self.triggered_algo_order_ids.clone();
+            let algo_client_ids = self.algo_client_order_ids.clone();
             let cancel = self.cancellation_token.clone();
-            let raw_forward_task = get_runtime().spawn(async move {
+
+            let ws_task = get_runtime().spawn(async move {
                 pin_mut!(stream);
                 loop {
                     tokio::select! {
                         Some(message) = stream.next() => {
-                            if let Err(e) = raw_tx.send(message) {
-                                log::error!("Failed to forward raw message to handler: {e}");
-                                break;
-                            }
+                            dispatch_ws_message(
+                                message,
+                                &emitter,
+                                &http_client,
+                                account_id,
+                                product_type,
+                                clock,
+                                &dispatch_state,
+                                &triggered_algo_ids,
+                                &algo_client_ids,
+                            );
                         }
                         () = cancel.cancelled() => {
-                            log::debug!("Raw message forwarding task cancelled");
+                            log::debug!("WS dispatch task cancelled");
                             break;
                         }
                     }
                 }
-            });
-
-            let emitter = self.emitter.clone();
-            let handler_cancel = self.cancellation_token.clone();
-
-            let ws_task = get_runtime().spawn(async move {
-                loop {
-                    tokio::select! {
-                        msg = handler.next() => {
-                            match msg {
-                                Some(event) => {
-                                    Self::handle_exec_event(event, &emitter);
-                                }
-                                None => break,
-                            }
-                        }
-                        () = handler_cancel.cancelled() => {
-                            log::debug!("Handler task cancelled");
-                            break;
-                        }
-                    }
-                }
-
-                raw_forward_task.abort();
             });
             *self.ws_task.lock().expect(MUTEX_POISONED) = Some(ws_task);
 
@@ -901,6 +1062,41 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
         self.await_account_registered(30.0).await?;
 
+        // Connect WS trading client (primary order transport for USD-M)
+        if let Some(ref mut ws_trading) = self.ws_trading_client {
+            match ws_trading.connect().await {
+                Ok(()) => {
+                    log::info!("Connected to Binance Futures WS trading API");
+
+                    let ws_trading_clone = ws_trading.clone();
+                    let emitter = self.emitter.clone();
+                    let account_id = self.core.account_id;
+                    let clock = self.clock;
+                    let dispatch_state = self.dispatch_state.clone();
+
+                    let handle = get_runtime().spawn(async move {
+                        while let Some(msg) = ws_trading_clone.recv().await {
+                            dispatch_ws_trading_message(
+                                msg,
+                                &emitter,
+                                account_id,
+                                clock,
+                                &dispatch_state,
+                            );
+                        }
+                    });
+
+                    *self.ws_trading_handle.lock().expect(MUTEX_POISONED) = Some(handle);
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to connect WS trading API: {e}. \
+                         Order operations will use HTTP fallback"
+                    );
+                }
+            }
+        }
+
         self.core.set_connected();
         log::info!("Connected: client_id={}", self.core.client_id);
         Ok(())
@@ -913,6 +1109,15 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
         // Cancel all background tasks
         self.cancellation_token.cancel();
+
+        // Abort WS trading task and disconnect
+        if let Some(handle) = self.ws_trading_handle.lock().expect(MUTEX_POISONED).take() {
+            handle.abort();
+        }
+
+        if let Some(ref mut ws_trading) = self.ws_trading_client {
+            ws_trading.disconnect().await;
+        }
 
         // Wait for WebSocket task to complete
         let ws_task = self.ws_task.lock().expect(MUTEX_POISONED).take();
@@ -944,447 +1149,6 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
         self.core.set_disconnected();
         log::info!("Disconnected: client_id={}", self.core.client_id);
-        Ok(())
-    }
-
-    fn query_account(&self, _cmd: &QueryAccount) -> anyhow::Result<()> {
-        self.update_account_state()
-    }
-
-    fn query_order(&self, cmd: &QueryOrder) -> anyhow::Result<()> {
-        log::debug!("query_order: client_order_id={}", cmd.client_order_id);
-
-        let http_client = self.http_client.clone();
-        let command = cmd.clone();
-        let emitter = self.emitter.clone();
-        let account_id = self.core.account_id;
-        let clock = self.clock;
-
-        let symbol = command.instrument_id.symbol.to_string();
-        let order_id = command.venue_order_id.map(|id| {
-            id.inner()
-                .parse::<i64>()
-                .expect("venue_order_id should be numeric")
-        });
-        let orig_client_order_id = Some(encode_broker_id(
-            &command.client_order_id,
-            BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-        ));
-        let (_, size_precision) = self.get_instrument_precision(command.instrument_id);
-
-        self.spawn_task("query_order", async move {
-            let mut builder = BinanceOrderQueryParamsBuilder::default();
-            builder.symbol(symbol.clone());
-
-            if let Some(oid) = order_id {
-                builder.order_id(oid);
-            }
-
-            if let Some(coid) = orig_client_order_id {
-                builder.orig_client_order_id(coid);
-            }
-            let params = builder.build().expect("order query params");
-
-            let result = http_client.query_order(&params).await;
-
-            match result {
-                Ok(order) => {
-                    let ts_init = clock.get_time_ns();
-                    let report = order.to_order_status_report(
-                        account_id,
-                        command.instrument_id,
-                        size_precision,
-                        ts_init,
-                    )?;
-
-                    emitter.send_order_status_report(report);
-                }
-                Err(e) => log::warn!("Failed to query order status: {e}"),
-            }
-
-            Ok(())
-        });
-
-        Ok(())
-    }
-
-    fn generate_account_state(
-        &self,
-        balances: Vec<AccountBalance>,
-        margins: Vec<MarginBalance>,
-        reported: bool,
-        ts_event: UnixNanos,
-    ) -> anyhow::Result<()> {
-        self.emitter
-            .emit_account_state(balances, margins, reported, ts_event);
-        Ok(())
-    }
-
-    fn start(&mut self) -> anyhow::Result<()> {
-        if self.core.is_started() {
-            return Ok(());
-        }
-
-        self.emitter.set_sender(get_exec_event_sender());
-        self.core.set_started();
-
-        let http_client = self.http_client.clone();
-
-        get_runtime().spawn(async move {
-            match http_client.request_instruments().await {
-                Ok(instruments) => {
-                    if instruments.is_empty() {
-                        log::warn!("No instruments returned for Binance Futures");
-                    } else {
-                        log::info!("Loaded {} Futures instruments", instruments.len());
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to request Binance Futures instruments: {e}");
-                }
-            }
-        });
-
-        log::info!(
-            "Started: client_id={}, account_id={}, account_type={:?}, environment={:?}",
-            self.core.client_id,
-            self.core.account_id,
-            self.core.account_type,
-            self.config.environment,
-        );
-        Ok(())
-    }
-
-    fn stop(&mut self) -> anyhow::Result<()> {
-        if self.core.is_stopped() {
-            return Ok(());
-        }
-
-        self.core.set_stopped();
-        self.core.set_disconnected();
-        self.abort_pending_tasks();
-        log::info!("Stopped: client_id={}", self.core.client_id);
-        Ok(())
-    }
-
-    fn submit_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
-        let order = self
-            .core
-            .cache()
-            .order(&cmd.client_order_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
-
-        if order.is_closed() {
-            let client_order_id = order.client_order_id();
-            log::warn!("Cannot submit closed order {client_order_id}");
-            return Ok(());
-        }
-
-        log::debug!("OrderSubmitted client_order_id={}", order.client_order_id());
-        self.emitter.emit_order_submitted(&order);
-
-        self.submit_order_internal(cmd)
-    }
-
-    fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
-        log::warn!(
-            "submit_order_list not yet implemented for Binance Futures (got {} orders)",
-            cmd.order_list.client_order_ids.len()
-        );
-        Ok(())
-    }
-
-    fn modify_order(&self, cmd: &ModifyOrder) -> anyhow::Result<()> {
-        let order = {
-            let cache = self.core.cache();
-            cache.order(&cmd.client_order_id).cloned()
-        };
-
-        let Some(order) = order else {
-            log::warn!(
-                "Cannot modify order {}: not found in cache",
-                cmd.client_order_id
-            );
-            let ts_init = self.clock.get_time_ns();
-            let rejected_event = OrderModifyRejected::new(
-                self.core.trader_id,
-                cmd.strategy_id,
-                cmd.instrument_id,
-                cmd.client_order_id,
-                "Order not found in cache for modify".into(),
-                UUID4::new(),
-                ts_init, // TODO: Use proper event timestamp
-                ts_init,
-                false,
-                cmd.venue_order_id,
-                Some(self.core.account_id),
-            );
-
-            self.emitter
-                .send_order_event(OrderEventAny::ModifyRejected(rejected_event));
-            return Ok(());
-        };
-
-        let http_client = self.http_client.clone();
-        let command = cmd.clone();
-        let emitter = self.emitter.clone();
-        let trader_id = self.core.trader_id;
-        let account_id = self.core.account_id;
-        let instrument_id = command.instrument_id;
-        let venue_order_id = command.venue_order_id;
-        let client_order_id = Some(command.client_order_id);
-        let order_side = order.order_side();
-        let quantity = command.quantity.unwrap_or_else(|| order.quantity());
-        let price = command.price.or_else(|| order.price());
-
-        let Some(price) = price else {
-            log::warn!(
-                "Cannot modify order {}: price required",
-                cmd.client_order_id
-            );
-            let ts_init = self.clock.get_time_ns();
-            let rejected_event = OrderModifyRejected::new(
-                self.core.trader_id,
-                cmd.strategy_id,
-                cmd.instrument_id,
-                cmd.client_order_id,
-                "Price required for order modification".into(),
-                UUID4::new(),
-                ts_init, // TODO: Use proper event timestamp
-                ts_init,
-                false,
-                cmd.venue_order_id,
-                Some(self.core.account_id),
-            );
-
-            self.emitter
-                .send_order_event(OrderEventAny::ModifyRejected(rejected_event));
-            return Ok(());
-        };
-        let clock = self.clock;
-
-        self.spawn_task("modify_order", async move {
-            let result = http_client
-                .modify_order(
-                    account_id,
-                    instrument_id,
-                    venue_order_id,
-                    client_order_id,
-                    order_side,
-                    quantity,
-                    price,
-                )
-                .await;
-
-            match result {
-                Ok(report) => {
-                    let ts_now = clock.get_time_ns();
-                    let updated_event = OrderUpdated::new(
-                        trader_id,
-                        command.strategy_id,
-                        command.instrument_id,
-                        command.client_order_id,
-                        quantity,
-                        UUID4::new(),
-                        ts_now,
-                        ts_now,
-                        false,
-                        Some(report.venue_order_id),
-                        Some(account_id),
-                        Some(price),
-                        None,
-                        None,
-                    );
-
-                    emitter.send_order_event(OrderEventAny::Updated(updated_event));
-                }
-                Err(e) => {
-                    let ts_now = clock.get_time_ns();
-                    let rejected_event = OrderModifyRejected::new(
-                        trader_id,
-                        command.strategy_id,
-                        command.instrument_id,
-                        command.client_order_id,
-                        format!("modify-order-failed: {e}").into(),
-                        UUID4::new(),
-                        ts_now,
-                        ts_now,
-                        false,
-                        command.venue_order_id,
-                        Some(account_id),
-                    );
-
-                    emitter.send_order_event(OrderEventAny::ModifyRejected(rejected_event));
-
-                    anyhow::bail!("Modify order failed: {e}");
-                }
-            }
-
-            Ok(())
-        });
-
-        Ok(())
-    }
-
-    fn cancel_order(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
-        self.cancel_order_internal(cmd);
-        Ok(())
-    }
-
-    fn cancel_all_orders(&self, cmd: &CancelAllOrders) -> anyhow::Result<()> {
-        let http_client = self.http_client.clone();
-        let instrument_id = cmd.instrument_id;
-
-        // HTTP only confirms request accepted; OrderCanceled comes from WebSocket
-        self.spawn_task("cancel_all_orders", async move {
-            match http_client.cancel_all_orders(instrument_id).await {
-                Ok(_) => {
-                    log::info!("Cancel all regular orders request accepted for {instrument_id}");
-                }
-                Err(e) => {
-                    log::error!("Failed to cancel all regular orders for {instrument_id}: {e}");
-                }
-            }
-
-            match http_client.cancel_all_algo_orders(instrument_id).await {
-                Ok(()) => {
-                    log::info!("Cancel all algo orders request accepted for {instrument_id}");
-                }
-                Err(e) => {
-                    log::error!("Failed to cancel all algo orders for {instrument_id}: {e}");
-                }
-            }
-
-            Ok(())
-        });
-
-        Ok(())
-    }
-
-    fn batch_cancel_orders(&self, cmd: &BatchCancelOrders) -> anyhow::Result<()> {
-        const BATCH_SIZE: usize = 5;
-
-        if cmd.cancels.is_empty() {
-            return Ok(());
-        }
-
-        let http_client = self.http_client.clone();
-        let command = cmd.clone();
-
-        let emitter = self.emitter.clone();
-        let trader_id = self.core.trader_id;
-        let account_id = self.core.account_id;
-        let clock = self.clock;
-
-        self.spawn_task("batch_cancel_orders", async move {
-            for chunk in command.cancels.chunks(BATCH_SIZE) {
-                let batch_items: Vec<BatchCancelItem> = chunk
-                    .iter()
-                    .map(|cancel| {
-                        if let Some(venue_order_id) = cancel.venue_order_id {
-                            let order_id = venue_order_id.inner().parse::<i64>().unwrap_or(0);
-                            if order_id != 0 {
-                                BatchCancelItem::by_order_id(
-                                    command.instrument_id.symbol.to_string(),
-                                    order_id,
-                                )
-                            } else {
-                                BatchCancelItem::by_client_order_id(
-                                    command.instrument_id.symbol.to_string(),
-                                    encode_broker_id(
-                                        &cancel.client_order_id,
-                                        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-                                    ),
-                                )
-                            }
-                        } else {
-                            BatchCancelItem::by_client_order_id(
-                                command.instrument_id.symbol.to_string(),
-                                encode_broker_id(
-                                    &cancel.client_order_id,
-                                    BINANCE_NAUTILUS_FUTURES_BROKER_ID,
-                                ),
-                            )
-                        }
-                    })
-                    .collect();
-
-                match http_client.batch_cancel_orders(&batch_items).await {
-                    Ok(results) => {
-                        for (i, result) in results.iter().enumerate() {
-                            let cancel = &chunk[i];
-                            match result {
-                                BatchOrderResult::Success(response) => {
-                                    let venue_order_id =
-                                        VenueOrderId::new(response.order_id.to_string());
-                                    let canceled_event = OrderCanceled::new(
-                                        trader_id,
-                                        cancel.strategy_id,
-                                        cancel.instrument_id,
-                                        cancel.client_order_id,
-                                        UUID4::new(),
-                                        cancel.ts_init,
-                                        clock.get_time_ns(),
-                                        false,
-                                        Some(venue_order_id),
-                                        Some(account_id),
-                                    );
-
-                                    emitter
-                                        .send_order_event(OrderEventAny::Canceled(canceled_event));
-                                }
-                                BatchOrderResult::Error(error) => {
-                                    let rejected_event = OrderCancelRejected::new(
-                                        trader_id,
-                                        cancel.strategy_id,
-                                        cancel.instrument_id,
-                                        cancel.client_order_id,
-                                        format!(
-                                            "batch-cancel-error: code={}, msg={}",
-                                            error.code, error.msg
-                                        )
-                                        .into(),
-                                        UUID4::new(),
-                                        clock.get_time_ns(),
-                                        cancel.ts_init,
-                                        false,
-                                        cancel.venue_order_id,
-                                        Some(account_id),
-                                    );
-
-                                    emitter.send_order_event(OrderEventAny::CancelRejected(
-                                        rejected_event,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        for cancel in chunk {
-                            let rejected_event = OrderCancelRejected::new(
-                                trader_id,
-                                cancel.strategy_id,
-                                cancel.instrument_id,
-                                cancel.client_order_id,
-                                format!("batch-cancel-request-failed: {e}").into(),
-                                UUID4::new(),
-                                clock.get_time_ns(),
-                                cancel.ts_init,
-                                false,
-                                cancel.venue_order_id,
-                                Some(account_id),
-                            );
-
-                            emitter.send_order_event(OrderEventAny::CancelRejected(rejected_event));
-                        }
-                    }
-                }
-            }
-
-            Ok(())
-        });
-
         Ok(())
     }
 
@@ -1540,8 +1304,12 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             }
         } else if let Some(instrument_id) = cmd.instrument_id {
             let symbol = instrument_id.symbol.to_string();
-            let start_time = cmd.start.map(|t| t.as_i64() / 1_000_000); // ns to ms
-            let end_time = cmd.end.map(|t| t.as_i64() / 1_000_000);
+            let start_time = cmd
+                .start
+                .map(|t| t.as_i64() / NANOSECONDS_IN_MILLISECOND as i64);
+            let end_time = cmd
+                .end
+                .map(|t| t.as_i64() / NANOSECONDS_IN_MILLISECOND as i64);
 
             let mut builder = BinanceAllOrdersParamsBuilder::default();
             builder.symbol(symbol);
@@ -1583,8 +1351,12 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         };
 
         let symbol = instrument_id.symbol.to_string();
-        let start_time = cmd.start.map(|t| t.as_i64() / 1_000_000);
-        let end_time = cmd.end.map(|t| t.as_i64() / 1_000_000);
+        let start_time = cmd
+            .start
+            .map(|t| t.as_i64() / NANOSECONDS_IN_MILLISECOND as i64);
+        let end_time = cmd
+            .end
+            .map(|t| t.as_i64() / NANOSECONDS_IN_MILLISECOND as i64);
 
         let mut builder = BinanceUserTradesParamsBuilder::default();
         builder.symbol(symbol);
@@ -1667,7 +1439,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         let ts_now = self.clock.get_time_ns();
 
         let start = lookback_mins.map(|mins| {
-            let lookback_ns = mins * 60 * 1_000_000_000;
+            let lookback_ns = mins_to_nanos(mins);
             UnixNanos::from(ts_now.as_u64().saturating_sub(lookback_ns))
         });
 
@@ -1704,5 +1476,1222 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         mass_status.add_position_reports(position_reports);
 
         Ok(Some(mass_status))
+    }
+
+    fn query_account(&self, _cmd: &QueryAccount) -> anyhow::Result<()> {
+        self.update_account_state()
+    }
+
+    fn query_order(&self, cmd: &QueryOrder) -> anyhow::Result<()> {
+        log::debug!("query_order: client_order_id={}", cmd.client_order_id);
+
+        let http_client = self.http_client.clone();
+        let command = cmd.clone();
+        let emitter = self.emitter.clone();
+        let account_id = self.core.account_id;
+        let clock = self.clock;
+
+        let symbol = command.instrument_id.symbol.to_string();
+        let order_id = command.venue_order_id.map(|id| {
+            id.inner()
+                .parse::<i64>()
+                .expect("venue_order_id should be numeric")
+        });
+        let orig_client_order_id = Some(encode_broker_id(
+            &command.client_order_id,
+            BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+        ));
+        let (_, size_precision) = self.get_instrument_precision(command.instrument_id);
+
+        self.spawn_task("query_order", async move {
+            let mut builder = BinanceOrderQueryParamsBuilder::default();
+            builder.symbol(symbol.clone());
+
+            if let Some(oid) = order_id {
+                builder.order_id(oid);
+            }
+
+            if let Some(coid) = orig_client_order_id {
+                builder.orig_client_order_id(coid);
+            }
+            let params = builder.build().expect("order query params");
+
+            let result = http_client.query_order(&params).await;
+
+            match result {
+                Ok(order) => {
+                    let ts_init = clock.get_time_ns();
+                    let report = order.to_order_status_report(
+                        account_id,
+                        command.instrument_id,
+                        size_precision,
+                        ts_init,
+                    )?;
+
+                    emitter.send_order_status_report(report);
+                }
+                Err(e) => log::warn!("Failed to query order status: {e}"),
+            }
+
+            Ok(())
+        });
+
+        Ok(())
+    }
+
+    fn generate_account_state(
+        &self,
+        balances: Vec<AccountBalance>,
+        margins: Vec<MarginBalance>,
+        reported: bool,
+        ts_event: UnixNanos,
+    ) -> anyhow::Result<()> {
+        self.emitter
+            .emit_account_state(balances, margins, reported, ts_event);
+        Ok(())
+    }
+
+    fn start(&mut self) -> anyhow::Result<()> {
+        if self.core.is_started() {
+            return Ok(());
+        }
+
+        self.emitter.set_sender(get_exec_event_sender());
+        self.core.set_started();
+
+        let http_client = self.http_client.clone();
+
+        get_runtime().spawn(async move {
+            match http_client.request_instruments().await {
+                Ok(instruments) => {
+                    if instruments.is_empty() {
+                        log::warn!("No instruments returned for Binance Futures");
+                    } else {
+                        log::info!("Loaded {} Futures instruments", instruments.len());
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to request Binance Futures instruments: {e}");
+                }
+            }
+        });
+
+        log::info!(
+            "Started: client_id={}, account_id={}, account_type={:?}, environment={:?}",
+            self.core.client_id,
+            self.core.account_id,
+            self.core.account_type,
+            self.config.environment,
+        );
+        Ok(())
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        if self.core.is_stopped() {
+            return Ok(());
+        }
+
+        self.core.set_stopped();
+        self.core.set_disconnected();
+        self.abort_pending_tasks();
+        log::info!("Stopped: client_id={}", self.core.client_id);
+        Ok(())
+    }
+
+    fn submit_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+        let order = self
+            .core
+            .cache()
+            .order(&cmd.client_order_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
+
+        if order.is_closed() {
+            let client_order_id = order.client_order_id();
+            log::warn!("Cannot submit closed order {client_order_id}");
+            return Ok(());
+        }
+
+        // Validate before submission (Initialized -> Denied is valid,
+        // but Submitted -> Denied is not, so validate before emitting OrderSubmitted)
+        if let Some(offset_type) = order.trailing_offset_type() {
+            if offset_type != TrailingOffsetType::BasisPoints {
+                anyhow::bail!(
+                    "Binance only supports TrailingOffsetType::BasisPoints, received {offset_type:?}"
+                );
+            }
+
+            if let Some(offset) = order.trailing_offset() {
+                let rate = (offset / rust_decimal::Decimal::ONE_HUNDRED).round_dp(1);
+                if rate < rust_decimal::Decimal::new(1, 1)
+                    || rate > rust_decimal::Decimal::new(10, 0)
+                {
+                    anyhow::bail!("callbackRate {rate}% out of Binance range [0.1, 10.0]");
+                }
+            }
+        }
+
+        let close_position = cmd
+            .params
+            .as_ref()
+            .and_then(|p| p.get_bool("close_position"))
+            .unwrap_or(false);
+
+        if close_position {
+            let order_type = order.order_type();
+
+            if !matches!(
+                order_type,
+                OrderType::StopMarket | OrderType::MarketIfTouched
+            ) {
+                anyhow::bail!(
+                    "`close_position` is not supported for order type {order_type:?} on Binance"
+                );
+            }
+
+            if order.is_reduce_only() {
+                anyhow::bail!("`close_position` cannot be combined with `reduce_only` on Binance");
+            }
+        }
+
+        log::debug!("OrderSubmitted client_order_id={}", order.client_order_id());
+        self.emitter.emit_order_submitted(&order);
+
+        self.submit_order_internal(cmd)
+    }
+
+    fn submit_order_list(&self, cmd: &SubmitOrderList) -> anyhow::Result<()> {
+        log::warn!(
+            "submit_order_list not yet implemented for Binance Futures (got {} orders)",
+            cmd.order_list.client_order_ids.len()
+        );
+        Ok(())
+    }
+
+    fn modify_order(&self, cmd: &ModifyOrder) -> anyhow::Result<()> {
+        let order = {
+            let cache = self.core.cache();
+            cache.order(&cmd.client_order_id).cloned()
+        };
+
+        let Some(order) = order else {
+            log::warn!(
+                "Cannot modify order {}: not found in cache",
+                cmd.client_order_id
+            );
+            let ts_init = self.clock.get_time_ns();
+            let rejected_event = OrderModifyRejected::new(
+                self.core.trader_id,
+                cmd.strategy_id,
+                cmd.instrument_id,
+                cmd.client_order_id,
+                "Order not found in cache for modify".into(),
+                UUID4::new(),
+                ts_init, // no venue timestamp, rejected locally
+                ts_init,
+                false,
+                cmd.venue_order_id,
+                Some(self.core.account_id),
+            );
+
+            self.emitter
+                .send_order_event(OrderEventAny::ModifyRejected(rejected_event));
+            return Ok(());
+        };
+
+        let http_client = self.http_client.clone();
+        let command = cmd.clone();
+        let emitter = self.emitter.clone();
+        let trader_id = self.core.trader_id;
+        let account_id = self.core.account_id;
+        let instrument_id = command.instrument_id;
+        let venue_order_id = command.venue_order_id;
+        let client_order_id = Some(command.client_order_id);
+        let order_side = order.order_side();
+        let quantity = command.quantity.unwrap_or_else(|| order.quantity());
+        let price = command.price.or_else(|| order.price());
+
+        let Some(price) = price else {
+            log::warn!(
+                "Cannot modify order {}: price required",
+                cmd.client_order_id
+            );
+            let ts_init = self.clock.get_time_ns();
+            let rejected_event = OrderModifyRejected::new(
+                self.core.trader_id,
+                cmd.strategy_id,
+                cmd.instrument_id,
+                cmd.client_order_id,
+                "Price required for order modification".into(),
+                UUID4::new(),
+                ts_init, // no venue timestamp, rejected locally
+                ts_init,
+                false,
+                cmd.venue_order_id,
+                Some(self.core.account_id),
+            );
+
+            self.emitter
+                .send_order_event(OrderEventAny::ModifyRejected(rejected_event));
+            return Ok(());
+        };
+        let clock = self.clock;
+
+        if self.ws_trading_active() {
+            let ws_client = self.ws_trading_client.as_ref().unwrap().clone();
+            let dispatch_state = self.dispatch_state.clone();
+
+            let binance_side = BinanceSide::try_from(order_side)?;
+            let orig_client_order_id =
+                client_order_id.map(|id| encode_broker_id(&id, BINANCE_NAUTILUS_FUTURES_BROKER_ID));
+
+            let mut modify_builder = BinanceModifyOrderParamsBuilder::default();
+            modify_builder
+                .symbol(format_binance_symbol(&instrument_id))
+                .side(binance_side)
+                .quantity(quantity.to_string())
+                .price(price.to_string());
+
+            if let Some(venue_id) = venue_order_id {
+                modify_builder.order_id(
+                    venue_id
+                        .inner()
+                        .parse::<i64>()
+                        .expect("venue_order_id should be numeric"),
+                );
+            }
+
+            if let Some(client_id) = orig_client_order_id {
+                modify_builder.orig_client_order_id(client_id);
+            }
+
+            let params = modify_builder.build().expect("valid modify params");
+
+            self.spawn_task("modify_order_ws", async move {
+                match ws_client.modify_order(params).await {
+                    Ok(request_id) => {
+                        dispatch_state.pending_requests.insert(
+                            request_id,
+                            PendingRequest {
+                                client_order_id: command.client_order_id,
+                                venue_order_id,
+                                operation: PendingOperation::Modify,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        let ts_now = clock.get_time_ns();
+                        let rejected = OrderModifyRejected::new(
+                            trader_id,
+                            command.strategy_id,
+                            command.instrument_id,
+                            command.client_order_id,
+                            format!("ws-modify-order-error: {e}").into(),
+                            UUID4::new(),
+                            ts_now,
+                            ts_now,
+                            false,
+                            command.venue_order_id,
+                            Some(account_id),
+                        );
+                        emitter.send_order_event(OrderEventAny::ModifyRejected(rejected));
+                        anyhow::bail!("WS modify order failed: {e}");
+                    }
+                }
+                Ok(())
+            });
+
+            return Ok(());
+        }
+
+        self.spawn_task("modify_order", async move {
+            let result = http_client
+                .modify_order(
+                    account_id,
+                    instrument_id,
+                    venue_order_id,
+                    client_order_id,
+                    order_side,
+                    quantity,
+                    price,
+                )
+                .await;
+
+            match result {
+                Ok(report) => {
+                    let ts_now = clock.get_time_ns();
+                    let updated_event = OrderUpdated::new(
+                        trader_id,
+                        command.strategy_id,
+                        command.instrument_id,
+                        command.client_order_id,
+                        quantity,
+                        UUID4::new(),
+                        ts_now,
+                        ts_now,
+                        false,
+                        Some(report.venue_order_id),
+                        Some(account_id),
+                        Some(price),
+                        None,
+                        None,
+                        false, // is_quote_quantity
+                    );
+
+                    emitter.send_order_event(OrderEventAny::Updated(updated_event));
+                }
+                Err(e) => {
+                    let ts_now = clock.get_time_ns();
+                    let rejected_event = OrderModifyRejected::new(
+                        trader_id,
+                        command.strategy_id,
+                        command.instrument_id,
+                        command.client_order_id,
+                        format!("modify-order-failed: {e}").into(),
+                        UUID4::new(),
+                        ts_now,
+                        ts_now,
+                        false,
+                        command.venue_order_id,
+                        Some(account_id),
+                    );
+
+                    emitter.send_order_event(OrderEventAny::ModifyRejected(rejected_event));
+
+                    anyhow::bail!("Modify order failed: {e}");
+                }
+            }
+
+            Ok(())
+        });
+
+        Ok(())
+    }
+
+    fn cancel_order(&self, cmd: &CancelOrder) -> anyhow::Result<()> {
+        self.cancel_order_internal(cmd);
+        Ok(())
+    }
+
+    fn cancel_all_orders(&self, cmd: &CancelAllOrders) -> anyhow::Result<()> {
+        let http_client = self.http_client.clone();
+        let instrument_id = cmd.instrument_id;
+        let ws_active = self.ws_trading_active();
+        let ws_client_clone = self.ws_trading_client.clone();
+
+        self.spawn_task("cancel_all_orders", async move {
+            if ws_active {
+                if let Some(ref ws_client) = ws_client_clone {
+                    let symbol = instrument_id.symbol.to_string();
+                    if let Err(e) = ws_client.cancel_all_orders(symbol).await {
+                        log::error!("WS cancel_all_orders failed: {e}");
+                    } else {
+                        log::info!(
+                            "WS cancel all regular orders request accepted for {instrument_id}"
+                        );
+                    }
+                }
+            } else {
+                match http_client.cancel_all_orders(instrument_id).await {
+                    Ok(_) => {
+                        log::info!(
+                            "Cancel all regular orders request accepted for {instrument_id}"
+                        );
+                    }
+                    Err(e) => {
+                        log::error!("Failed to cancel all regular orders for {instrument_id}: {e}");
+                    }
+                }
+            }
+
+            // Algo orders always go through HTTP (WS API does not support algo service)
+            match http_client.cancel_all_algo_orders(instrument_id).await {
+                Ok(()) => {
+                    log::info!("Cancel all algo orders request accepted for {instrument_id}");
+                }
+                Err(e) => {
+                    log::error!("Failed to cancel all algo orders for {instrument_id}: {e}");
+                }
+            }
+
+            Ok(())
+        });
+
+        Ok(())
+    }
+
+    fn batch_cancel_orders(&self, cmd: &BatchCancelOrders) -> anyhow::Result<()> {
+        const BATCH_SIZE: usize = 5;
+
+        if cmd.cancels.is_empty() {
+            return Ok(());
+        }
+
+        let http_client = self.http_client.clone();
+        let command = cmd.clone();
+
+        let emitter = self.emitter.clone();
+        let trader_id = self.core.trader_id;
+        let account_id = self.core.account_id;
+        let clock = self.clock;
+
+        self.spawn_task("batch_cancel_orders", async move {
+            for chunk in command.cancels.chunks(BATCH_SIZE) {
+                let batch_items: Vec<BatchCancelItem> = chunk
+                    .iter()
+                    .map(|cancel| {
+                        if let Some(venue_order_id) = cancel.venue_order_id {
+                            let order_id = venue_order_id.inner().parse::<i64>().unwrap_or(0);
+                            if order_id != 0 {
+                                BatchCancelItem::by_order_id(
+                                    command.instrument_id.symbol.to_string(),
+                                    order_id,
+                                )
+                            } else {
+                                BatchCancelItem::by_client_order_id(
+                                    command.instrument_id.symbol.to_string(),
+                                    encode_broker_id(
+                                        &cancel.client_order_id,
+                                        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+                                    ),
+                                )
+                            }
+                        } else {
+                            BatchCancelItem::by_client_order_id(
+                                command.instrument_id.symbol.to_string(),
+                                encode_broker_id(
+                                    &cancel.client_order_id,
+                                    BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+                                ),
+                            )
+                        }
+                    })
+                    .collect();
+
+                match http_client.batch_cancel_orders(&batch_items).await {
+                    Ok(results) => {
+                        for (i, result) in results.iter().enumerate() {
+                            let cancel = &chunk[i];
+                            match result {
+                                BatchOrderResult::Success(response) => {
+                                    let venue_order_id =
+                                        VenueOrderId::new(response.order_id.to_string());
+                                    let canceled_event = OrderCanceled::new(
+                                        trader_id,
+                                        cancel.strategy_id,
+                                        cancel.instrument_id,
+                                        cancel.client_order_id,
+                                        UUID4::new(),
+                                        cancel.ts_init,
+                                        clock.get_time_ns(),
+                                        false,
+                                        Some(venue_order_id),
+                                        Some(account_id),
+                                    );
+
+                                    emitter
+                                        .send_order_event(OrderEventAny::Canceled(canceled_event));
+                                }
+                                BatchOrderResult::Error(error) => {
+                                    let rejected_event = OrderCancelRejected::new(
+                                        trader_id,
+                                        cancel.strategy_id,
+                                        cancel.instrument_id,
+                                        cancel.client_order_id,
+                                        format!(
+                                            "batch-cancel-error: code={}, msg={}",
+                                            error.code, error.msg
+                                        )
+                                        .into(),
+                                        UUID4::new(),
+                                        clock.get_time_ns(),
+                                        cancel.ts_init,
+                                        false,
+                                        cancel.venue_order_id,
+                                        Some(account_id),
+                                    );
+
+                                    emitter.send_order_event(OrderEventAny::CancelRejected(
+                                        rejected_event,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        for cancel in chunk {
+                            let rejected_event = OrderCancelRejected::new(
+                                trader_id,
+                                cancel.strategy_id,
+                                cancel.instrument_id,
+                                cancel.client_order_id,
+                                format!("batch-cancel-request-failed: {e}").into(),
+                                UUID4::new(),
+                                clock.get_time_ns(),
+                                cancel.ts_init,
+                                false,
+                                cancel.venue_order_id,
+                                Some(account_id),
+                            );
+
+                            emitter.send_order_event(OrderEventAny::CancelRejected(rejected_event));
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        });
+
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_ws_message(
+    msg: BinanceFuturesWsStreamsMessage,
+    emitter: &ExecutionEventEmitter,
+    http_client: &BinanceFuturesHttpClient,
+    account_id: AccountId,
+    product_type: BinanceProductType,
+    clock: &'static AtomicTime,
+    dispatch_state: &WsDispatchState,
+    triggered_algo_ids: &Arc<AtomicSet<ClientOrderId>>,
+    algo_client_ids: &Arc<AtomicSet<ClientOrderId>>,
+) {
+    match msg {
+        BinanceFuturesWsStreamsMessage::OrderUpdate(update) => {
+            dispatch_order_update(
+                &update,
+                emitter,
+                http_client,
+                account_id,
+                product_type,
+                clock,
+                dispatch_state,
+            );
+        }
+        BinanceFuturesWsStreamsMessage::AlgoUpdate(update) => {
+            dispatch_algo_update(
+                &update,
+                emitter,
+                http_client,
+                account_id,
+                product_type,
+                clock,
+                dispatch_state,
+                triggered_algo_ids,
+                algo_client_ids,
+            );
+        }
+        BinanceFuturesWsStreamsMessage::AccountUpdate(update) => {
+            let ts_init = clock.get_time_ns();
+            if let Some(state) = parse_futures_account_update(&update, account_id, ts_init) {
+                emitter.send_account_state(state);
+            }
+        }
+        BinanceFuturesWsStreamsMessage::MarginCall(mc) => {
+            log::warn!(
+                "Margin call: cross_wallet_balance={}, positions_at_risk={}",
+                mc.cross_wallet_balance,
+                mc.positions.len()
+            );
+        }
+        BinanceFuturesWsStreamsMessage::AccountConfigUpdate(cfg) => {
+            if let Some(ref lc) = cfg.leverage_config {
+                log::info!(
+                    "Account config update: symbol={}, leverage={}",
+                    lc.symbol,
+                    lc.leverage
+                );
+            }
+        }
+        BinanceFuturesWsStreamsMessage::ListenKeyExpired => {
+            log::warn!("Listen key expired, awaiting reconnection");
+        }
+        BinanceFuturesWsStreamsMessage::Reconnected => {
+            log::info!("User data stream WebSocket reconnected");
+        }
+        BinanceFuturesWsStreamsMessage::Error(err) => {
+            log::error!(
+                "User data stream WebSocket error: code={}, msg={}",
+                err.code,
+                err.msg
+            );
+        }
+        // Market data messages ignored by execution client
+        BinanceFuturesWsStreamsMessage::AggTrade(_)
+        | BinanceFuturesWsStreamsMessage::Trade(_)
+        | BinanceFuturesWsStreamsMessage::BookTicker(_)
+        | BinanceFuturesWsStreamsMessage::DepthUpdate(_)
+        | BinanceFuturesWsStreamsMessage::MarkPrice(_)
+        | BinanceFuturesWsStreamsMessage::Kline(_)
+        | BinanceFuturesWsStreamsMessage::ForceOrder(_)
+        | BinanceFuturesWsStreamsMessage::Ticker(_) => {}
+    }
+}
+
+/// Dispatches a Futures order update with tracked/untracked routing.
+///
+/// Tracked orders produce proper order events. Untracked orders fall back
+/// to execution reports for reconciliation.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_order_update(
+    msg: &super::websocket::streams::messages::BinanceFuturesOrderUpdateMsg,
+    emitter: &ExecutionEventEmitter,
+    http_client: &BinanceFuturesHttpClient,
+    account_id: AccountId,
+    product_type: BinanceProductType,
+    clock: &'static AtomicTime,
+    dispatch_state: &WsDispatchState,
+) {
+    let order = &msg.order;
+    let symbol_ustr = ustr::Ustr::from(order.symbol.as_str());
+    let ts_init = clock.get_time_ns();
+    let ts_event = UnixNanos::from_millis(msg.event_time as u64);
+
+    let cache = http_client.instruments_cache();
+    let cached_instrument = cache.get(&symbol_ustr);
+
+    if cached_instrument.is_none() && order.execution_type == BinanceExecutionType::Trade {
+        log::error!(
+            "Instrument not in cache for fill: {}, skipping to avoid precision mismatch",
+            order.symbol
+        );
+        return;
+    }
+
+    let (instrument_id, price_precision, size_precision) = if let Some(inst) = cached_instrument {
+        (
+            inst.id(),
+            inst.price_precision() as u8,
+            inst.quantity_precision() as u8,
+        )
+    } else {
+        let id = crate::common::symbol::format_instrument_id(&symbol_ustr, product_type);
+        log::warn!(
+            "Instrument not in cache for {}, using default precision",
+            order.symbol
+        );
+        (id, 8, 8)
+    };
+
+    let client_order_id = ClientOrderId::new(decode_broker_id(
+        &order.client_order_id,
+        BINANCE_NAUTILUS_FUTURES_BROKER_ID,
+    ));
+
+    let identity = dispatch_state
+        .order_identities
+        .get(&client_order_id)
+        .map(|r| r.clone());
+
+    if let Some(identity) = identity {
+        let venue_order_id = VenueOrderId::new(order.order_id.to_string());
+
+        match order.execution_type {
+            BinanceExecutionType::New => {
+                if dispatch_state.has_emitted_accepted(&client_order_id)
+                    || dispatch_state.has_filled(&client_order_id)
+                {
+                    log::debug!("Skipping duplicate Accepted for {client_order_id}");
+                    return;
+                }
+                dispatch_state.insert_accepted(client_order_id);
+                let accepted = OrderAccepted::new(
+                    emitter.trader_id(),
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    client_order_id,
+                    venue_order_id,
+                    account_id,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                );
+                emitter.send_order_event(OrderEventAny::Accepted(accepted));
+            }
+            BinanceExecutionType::Trade => {
+                ensure_accepted_emitted(
+                    client_order_id,
+                    account_id,
+                    venue_order_id,
+                    &identity,
+                    emitter,
+                    dispatch_state,
+                    ts_init,
+                );
+
+                let last_qty: f64 = order.last_filled_qty.parse().unwrap_or(0.0);
+                let last_px: f64 = order.last_filled_price.parse().unwrap_or(0.0);
+                let commission: f64 = order
+                    .commission
+                    .as_deref()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0.0);
+                let commission_currency = order
+                    .commission_asset
+                    .as_ref()
+                    .map_or_else(Currency::USDT, |a| Currency::from(a.as_str()));
+
+                let liquidity_side = if order.is_maker {
+                    LiquiditySide::Maker
+                } else {
+                    LiquiditySide::Taker
+                };
+
+                let filled = OrderFilled::new(
+                    emitter.trader_id(),
+                    identity.strategy_id,
+                    instrument_id,
+                    client_order_id,
+                    venue_order_id,
+                    account_id,
+                    TradeId::new(order.trade_id.to_string()),
+                    identity.order_side,
+                    identity.order_type,
+                    Quantity::new(last_qty, size_precision),
+                    Price::new(last_px, price_precision),
+                    commission_currency,
+                    liquidity_side,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    None,
+                    Some(Money::new(commission, commission_currency)),
+                );
+
+                dispatch_state.insert_filled(client_order_id);
+                emitter.send_order_event(OrderEventAny::Filled(filled));
+
+                let cum_qty: f64 = order.cumulative_filled_qty.parse().unwrap_or(0.0);
+                let orig_qty: f64 = order.original_qty.parse().unwrap_or(0.0);
+                if (orig_qty - cum_qty) <= 0.0 {
+                    dispatch_state.cleanup_terminal(client_order_id);
+                }
+            }
+            BinanceExecutionType::Canceled | BinanceExecutionType::Expired => {
+                ensure_accepted_emitted(
+                    client_order_id,
+                    account_id,
+                    venue_order_id,
+                    &identity,
+                    emitter,
+                    dispatch_state,
+                    ts_init,
+                );
+                let canceled = OrderCanceled::new(
+                    emitter.trader_id(),
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    client_order_id,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    Some(venue_order_id),
+                    Some(account_id),
+                );
+                dispatch_state.cleanup_terminal(client_order_id);
+                emitter.send_order_event(OrderEventAny::Canceled(canceled));
+            }
+            BinanceExecutionType::Amendment => {
+                let quantity: f64 = order.original_qty.parse().unwrap_or(0.0);
+                let price: f64 = order.original_price.parse().unwrap_or(0.0);
+
+                let updated = OrderUpdated::new(
+                    emitter.trader_id(),
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    client_order_id,
+                    Quantity::new(quantity, size_precision),
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    Some(venue_order_id),
+                    Some(account_id),
+                    Some(Price::new(price, price_precision)),
+                    None,
+                    None,
+                    false, // is_quote_quantity
+                );
+                emitter.send_order_event(OrderEventAny::Updated(updated));
+            }
+            BinanceExecutionType::Calculated => {
+                log::warn!(
+                    "Calculated execution (liquidation/ADL): symbol={}, client_order_id={}",
+                    order.symbol,
+                    order.client_order_id
+                );
+            }
+        }
+    } else {
+        // Untracked: fall back to reports for reconciliation
+        match order.execution_type {
+            BinanceExecutionType::Trade => {
+                match parse_futures_order_update_to_fill(
+                    msg,
+                    instrument_id,
+                    price_precision,
+                    size_precision,
+                    account_id,
+                    ts_init,
+                ) {
+                    Ok(fill) => emitter.send_fill_report(fill),
+                    Err(e) => log::error!("Failed to parse fill report: {e}"),
+                }
+                match parse_futures_order_update_to_order_status(
+                    msg,
+                    instrument_id,
+                    price_precision,
+                    size_precision,
+                    account_id,
+                    ts_init,
+                ) {
+                    Ok(status) => emitter.send_order_status_report(status),
+                    Err(e) => log::error!("Failed to parse order status report: {e}"),
+                }
+            }
+            BinanceExecutionType::New
+            | BinanceExecutionType::Canceled
+            | BinanceExecutionType::Expired
+            | BinanceExecutionType::Amendment => {
+                match parse_futures_order_update_to_order_status(
+                    msg,
+                    instrument_id,
+                    price_precision,
+                    size_precision,
+                    account_id,
+                    ts_init,
+                ) {
+                    Ok(status) => emitter.send_order_status_report(status),
+                    Err(e) => log::error!("Failed to parse order status report: {e}"),
+                }
+            }
+            BinanceExecutionType::Calculated => {
+                log::warn!(
+                    "Calculated execution (liquidation/ADL): symbol={}, client_order_id={}",
+                    order.symbol,
+                    order.client_order_id
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_algo_update(
+    msg: &super::websocket::streams::messages::BinanceFuturesAlgoUpdateMsg,
+    emitter: &ExecutionEventEmitter,
+    http_client: &BinanceFuturesHttpClient,
+    account_id: AccountId,
+    product_type: BinanceProductType,
+    clock: &'static AtomicTime,
+    dispatch_state: &WsDispatchState,
+    triggered_algo_ids: &Arc<AtomicSet<ClientOrderId>>,
+    algo_client_ids: &Arc<AtomicSet<ClientOrderId>>,
+) {
+    use crate::common::enums::BinanceAlgoStatus;
+
+    let algo_data = &msg.algo_order;
+    let ts_init = clock.get_time_ns();
+    let ts_event = UnixNanos::from_millis(msg.event_time as u64);
+    let client_order_id = decode_algo_client_id(algo_data);
+
+    let symbol_ustr = ustr::Ustr::from(algo_data.symbol.as_str());
+    let (instrument_id, _price_precision, _size_precision) =
+        if let Some(inst) = http_client.instruments_cache().get(&symbol_ustr) {
+            (
+                inst.id(),
+                inst.price_precision() as u8,
+                inst.quantity_precision() as u8,
+            )
+        } else {
+            let id = crate::common::symbol::format_instrument_id(&symbol_ustr, product_type);
+            log::warn!(
+                "Instrument not in cache for {}, using default precision",
+                algo_data.symbol
+            );
+            (id, 8, 8)
+        };
+
+    let identity = dispatch_state
+        .order_identities
+        .get(&client_order_id)
+        .map(|r| r.clone());
+
+    match algo_data.algo_status {
+        BinanceAlgoStatus::New => {
+            algo_client_ids.insert(client_order_id);
+        }
+        BinanceAlgoStatus::Triggering => {
+            log::info!(
+                "Algo order triggering: client_order_id={}, algo_id={}, symbol={}",
+                algo_data.client_algo_id,
+                algo_data.algo_id,
+                algo_data.symbol
+            );
+        }
+        BinanceAlgoStatus::Triggered => {
+            triggered_algo_ids.insert(client_order_id);
+            log::info!(
+                "Algo order triggered: client_order_id={}, algo_id={}, actual_order_id={:?}",
+                algo_data.client_algo_id,
+                algo_data.algo_id,
+                algo_data.actual_order_id
+            );
+        }
+        BinanceAlgoStatus::Canceled | BinanceAlgoStatus::Expired => {
+            algo_client_ids.remove(&client_order_id);
+            triggered_algo_ids.remove(&client_order_id);
+
+            if let Some(identity) = identity {
+                let venue_order_id = algo_data
+                    .actual_order_id
+                    .as_ref()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| VenueOrderId::new(id.clone()));
+
+                let canceled = OrderCanceled::new(
+                    emitter.trader_id(),
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    client_order_id,
+                    UUID4::new(),
+                    ts_event,
+                    ts_init,
+                    false,
+                    venue_order_id,
+                    Some(account_id),
+                );
+                dispatch_state.cleanup_terminal(client_order_id);
+                emitter.send_order_event(OrderEventAny::Canceled(canceled));
+            } else if let Some(report) = parse_futures_algo_update_to_order_status(
+                algo_data,
+                msg.event_time,
+                instrument_id,
+                _price_precision,
+                _size_precision,
+                account_id,
+                ts_init,
+            ) {
+                emitter.send_order_status_report(report);
+            }
+        }
+        BinanceAlgoStatus::Rejected => {
+            algo_client_ids.remove(&client_order_id);
+            triggered_algo_ids.remove(&client_order_id);
+
+            if let Some(identity) = identity {
+                dispatch_state.cleanup_terminal(client_order_id);
+                emitter.emit_order_rejected_event(
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    client_order_id,
+                    "REJECTED",
+                    ts_init,
+                    false,
+                );
+            } else if let Some(report) = parse_futures_algo_update_to_order_status(
+                algo_data,
+                msg.event_time,
+                instrument_id,
+                _price_precision,
+                _size_precision,
+                account_id,
+                ts_init,
+            ) {
+                emitter.send_order_status_report(report);
+            }
+        }
+        BinanceAlgoStatus::Finished => {
+            algo_client_ids.remove(&client_order_id);
+            triggered_algo_ids.remove(&client_order_id);
+            dispatch_state.cleanup_terminal(client_order_id);
+
+            let executed_qty: f64 = algo_data
+                .executed_qty
+                .as_ref()
+                .and_then(|q| q.parse().ok())
+                .unwrap_or(0.0);
+
+            if executed_qty > 0.0 {
+                log::debug!(
+                    "Algo order finished with fills: client_order_id={}, executed_qty={}",
+                    algo_data.client_algo_id,
+                    executed_qty
+                );
+            } else {
+                log::debug!(
+                    "Algo order finished without fills: client_order_id={}",
+                    algo_data.client_algo_id
+                );
+            }
+        }
+        BinanceAlgoStatus::Unknown => {
+            log::warn!(
+                "Unknown algo status: client_order_id={}, algo_id={}",
+                algo_data.client_algo_id,
+                algo_data.algo_id
+            );
+        }
+    }
+}
+
+fn dispatch_ws_trading_message(
+    msg: BinanceFuturesWsTradingMessage,
+    emitter: &ExecutionEventEmitter,
+    account_id: AccountId,
+    clock: &'static AtomicTime,
+    dispatch_state: &WsDispatchState,
+) {
+    match msg {
+        BinanceFuturesWsTradingMessage::OrderAccepted {
+            request_id,
+            response,
+        } => {
+            dispatch_state.pending_requests.remove(&request_id);
+            log::debug!(
+                "WS order accepted: request_id={request_id}, order_id={}",
+                response.order_id
+            );
+            // OrderAccepted event comes from user data stream (ORDER_TRADE_UPDATE)
+        }
+        BinanceFuturesWsTradingMessage::OrderRejected {
+            request_id,
+            code,
+            msg,
+        } => {
+            log::debug!("WS order rejected: request_id={request_id}, code={code}, msg={msg}");
+            if let Some((_, pending)) = dispatch_state.pending_requests.remove(&request_id) {
+                // Clone to drop the DashMap read guard before cleanup_terminal
+                let identity = dispatch_state
+                    .order_identities
+                    .get(&pending.client_order_id)
+                    .map(|r| r.clone());
+
+                if let Some(identity) = identity {
+                    let due_post_only = i64::from(code) == BINANCE_GTX_ORDER_REJECT_CODE;
+                    let ts_now = clock.get_time_ns();
+                    let rejected = OrderRejected::new(
+                        emitter.trader_id(),
+                        identity.strategy_id,
+                        identity.instrument_id,
+                        pending.client_order_id,
+                        account_id,
+                        ustr::Ustr::from(&format!("code={code}: {msg}")),
+                        UUID4::new(),
+                        ts_now,
+                        ts_now,
+                        false,
+                        due_post_only,
+                    );
+                    dispatch_state.cleanup_terminal(pending.client_order_id);
+                    emitter.send_order_event(OrderEventAny::Rejected(rejected));
+                } else {
+                    log::warn!(
+                        "No order identity for {}, cannot emit OrderRejected",
+                        pending.client_order_id
+                    );
+                }
+            } else {
+                log::warn!("No pending request for {request_id}, cannot emit OrderRejected");
+            }
+        }
+        BinanceFuturesWsTradingMessage::OrderCanceled {
+            request_id,
+            response,
+        } => {
+            dispatch_state.pending_requests.remove(&request_id);
+            log::debug!(
+                "WS order canceled: request_id={request_id}, order_id={}",
+                response.order_id
+            );
+            // OrderCanceled event comes from user data stream (ORDER_TRADE_UPDATE)
+        }
+        BinanceFuturesWsTradingMessage::CancelRejected {
+            request_id,
+            code,
+            msg,
+        } => {
+            log::warn!("WS cancel rejected: request_id={request_id}, code={code}, msg={msg}");
+            if let Some((_, pending)) = dispatch_state.pending_requests.remove(&request_id)
+                && let Some(identity) = dispatch_state
+                    .order_identities
+                    .get(&pending.client_order_id)
+            {
+                let ts_now = clock.get_time_ns();
+                let rejected = OrderCancelRejected::new(
+                    emitter.trader_id(),
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    pending.client_order_id,
+                    ustr::Ustr::from(&format!("code={code}: {msg}")),
+                    UUID4::new(),
+                    ts_now,
+                    ts_now,
+                    false,
+                    None,
+                    Some(account_id),
+                );
+                emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
+            }
+        }
+        BinanceFuturesWsTradingMessage::OrderModified {
+            request_id,
+            response,
+        } => {
+            dispatch_state.pending_requests.remove(&request_id);
+            log::debug!(
+                "WS order modified: request_id={request_id}, order_id={}",
+                response.order_id
+            );
+            // OrderUpdated event comes from user data stream (ORDER_TRADE_UPDATE)
+        }
+        BinanceFuturesWsTradingMessage::ModifyRejected {
+            request_id,
+            code,
+            msg,
+        } => {
+            log::warn!("WS modify rejected: request_id={request_id}, code={code}, msg={msg}");
+            if let Some((_, pending)) = dispatch_state.pending_requests.remove(&request_id)
+                && let Some(identity) = dispatch_state
+                    .order_identities
+                    .get(&pending.client_order_id)
+            {
+                let ts_now = clock.get_time_ns();
+                let rejected = OrderModifyRejected::new(
+                    emitter.trader_id(),
+                    identity.strategy_id,
+                    identity.instrument_id,
+                    pending.client_order_id,
+                    ustr::Ustr::from(&format!("code={code}: {msg}")),
+                    UUID4::new(),
+                    ts_now,
+                    ts_now,
+                    false,
+                    None,
+                    Some(account_id),
+                );
+                emitter.send_order_event(OrderEventAny::ModifyRejected(rejected));
+            }
+        }
+        BinanceFuturesWsTradingMessage::AllOrdersCanceled { request_id } => {
+            dispatch_state.pending_requests.remove(&request_id);
+            log::debug!("WS all orders canceled: request_id={request_id}");
+        }
+        BinanceFuturesWsTradingMessage::Connected => {
+            log::info!("WS trading API connected");
+        }
+        BinanceFuturesWsTradingMessage::Reconnected => {
+            log::info!("WS trading API reconnected");
+        }
+        BinanceFuturesWsTradingMessage::Error(err) => {
+            log::error!("WS trading API error: {err}");
+        }
     }
 }

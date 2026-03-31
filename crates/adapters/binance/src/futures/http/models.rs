@@ -800,7 +800,7 @@ impl BinanceFuturesAccountInfo {
 
         let ts_event = self
             .update_time
-            .map_or(ts_init, |t| UnixNanos::from((t * 1_000_000) as u64));
+            .map_or(ts_init, |t| UnixNanos::from_millis(t as u64));
 
         Ok(AccountState::new(
             account_id,
@@ -939,7 +939,7 @@ impl BinanceFuturesOrder {
     ) -> anyhow::Result<OrderStatusReport> {
         let ts_event = self
             .update_time
-            .map_or(ts_init, |t| UnixNanos::from((t * 1_000_000) as u64));
+            .map_or(ts_init, |t| UnixNanos::from_millis(t as u64));
 
         let client_order_id = ClientOrderId::new(decode_broker_id(
             &self.client_order_id,
@@ -1049,7 +1049,7 @@ impl BinanceUserTrade {
         size_precision: u8,
         ts_init: UnixNanos,
     ) -> anyhow::Result<FillReport> {
-        let ts_event = UnixNanos::from((self.time * 1_000_000) as u64);
+        let ts_event = UnixNanos::from_millis(self.time as u64);
 
         let venue_order_id = VenueOrderId::new(self.order_id.to_string());
         let trade_id = TradeId::new(self.id.to_string());
@@ -1226,7 +1226,7 @@ impl BinanceFuturesAlgoOrder {
         let ts_event = self
             .update_time
             .or(self.create_time)
-            .map_or(ts_init, |t| UnixNanos::from((t * 1_000_000) as u64));
+            .map_or(ts_init, |t| UnixNanos::from_millis(t as u64));
 
         let client_order_id = ClientOrderId::new(decode_broker_id(
             &self.client_algo_id,
@@ -1324,135 +1324,13 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-
-    /// Test fixture from Binance API docs for GET /fapi/v2/account
-    const ACCOUNT_INFO_V2_JSON: &str = r#"{
-        "feeTier": 0,
-        "canTrade": true,
-        "canDeposit": true,
-        "canWithdraw": true,
-        "updateTime": 0,
-        "multiAssetsMargin": false,
-        "tradeGroupId": -1,
-        "totalInitialMargin": "0.00000000",
-        "totalMaintMargin": "0.00000000",
-        "totalWalletBalance": "23.72469206",
-        "totalUnrealizedProfit": "0.00000000",
-        "totalMarginBalance": "23.72469206",
-        "totalPositionInitialMargin": "0.00000000",
-        "totalOpenOrderInitialMargin": "0.00000000",
-        "totalCrossWalletBalance": "23.72469206",
-        "totalCrossUnPnl": "0.00000000",
-        "availableBalance": "23.72469206",
-        "maxWithdrawAmount": "23.72469206",
-        "assets": [
-            {
-                "asset": "USDT",
-                "walletBalance": "23.72469206",
-                "unrealizedProfit": "0.00000000",
-                "marginBalance": "23.72469206",
-                "maintMargin": "0.00000000",
-                "initialMargin": "0.00000000",
-                "positionInitialMargin": "0.00000000",
-                "openOrderInitialMargin": "0.00000000",
-                "crossWalletBalance": "23.72469206",
-                "crossUnPnl": "0.00000000",
-                "availableBalance": "23.72469206",
-                "maxWithdrawAmount": "23.72469206",
-                "marginAvailable": true,
-                "updateTime": 1625474304765
-            }
-        ],
-        "positions": [
-            {
-                "symbol": "BTCUSDT",
-                "initialMargin": "0",
-                "maintMargin": "0",
-                "unrealizedProfit": "0.00000000",
-                "positionInitialMargin": "0",
-                "openOrderInitialMargin": "0",
-                "leverage": "100",
-                "isolated": false,
-                "entryPrice": "0.00000",
-                "maxNotional": "250000",
-                "bidNotional": "0",
-                "askNotional": "0",
-                "positionSide": "BOTH",
-                "positionAmt": "0",
-                "updateTime": 0
-            }
-        ]
-    }"#;
-
-    /// Test fixture for GET /fapi/v2/positionRisk
-    const POSITION_RISK_JSON: &str = r#"[
-        {
-            "symbol": "BTCUSDT",
-            "positionAmt": "0.001",
-            "entryPrice": "50000.0",
-            "markPrice": "51000.0",
-            "unRealizedProfit": "1.00000000",
-            "liquidationPrice": "45000.0",
-            "leverage": "20",
-            "maxNotionalValue": "250000",
-            "marginType": "cross",
-            "isolatedMargin": "0.00000000",
-            "isAutoAddMargin": "false",
-            "positionSide": "BOTH",
-            "notional": "51.0",
-            "isolatedWallet": "0",
-            "updateTime": 1625474304765,
-            "breakEvenPrice": "50100.0"
-        }
-    ]"#;
-
-    /// Test fixture for balance endpoint
-    const BALANCE_JSON: &str = r#"[
-        {
-            "accountAlias": "SgsR",
-            "asset": "USDT",
-            "balance": "122.12345678",
-            "crossWalletBalance": "122.12345678",
-            "crossUnPnl": "0.00000000",
-            "availableBalance": "122.12345678",
-            "maxWithdrawAmount": "122.12345678",
-            "marginAvailable": true,
-            "updateTime": 1617939110373
-        }
-    ]"#;
-
-    /// Test fixture for order response
-    const ORDER_JSON: &str = r#"{
-        "orderId": 12345678,
-        "symbol": "BTCUSDT",
-        "status": "NEW",
-        "clientOrderId": "testOrder123",
-        "price": "50000.00",
-        "avgPrice": "0.00",
-        "origQty": "0.001",
-        "executedQty": "0.000",
-        "cumQuote": "0.00",
-        "timeInForce": "GTC",
-        "type": "LIMIT",
-        "reduceOnly": false,
-        "closePosition": false,
-        "side": "BUY",
-        "positionSide": "BOTH",
-        "stopPrice": "0.00",
-        "workingType": "CONTRACT_PRICE",
-        "priceProtect": false,
-        "origType": "LIMIT",
-        "priceMatch": "NONE",
-        "selfTradePreventionMode": "NONE",
-        "goodTillDate": 0,
-        "time": 1625474304765,
-        "updateTime": 1625474304765
-    }"#;
+    use crate::common::testing::load_fixture_string;
 
     #[rstest]
     fn test_parse_account_info_v2() {
+        let json = load_fixture_string("futures/http_json/account_info_v2.json");
         let account: BinanceFuturesAccountInfo =
-            serde_json::from_str(ACCOUNT_INFO_V2_JSON).expect("Failed to parse account info");
+            serde_json::from_str(&json).expect("Failed to parse account info");
 
         assert_eq!(
             account.total_wallet_balance,
@@ -1467,9 +1345,55 @@ mod tests {
     }
 
     #[rstest]
+    fn test_account_info_to_account_state_zero_margins() {
+        let json = load_fixture_string("futures/http_json/account_info_v2.json");
+        let account: BinanceFuturesAccountInfo =
+            serde_json::from_str(&json).expect("Failed to parse account info");
+
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+        let state = account.to_account_state(account_id, ts_init).unwrap();
+
+        assert_eq!(state.account_id, account_id);
+        assert_eq!(state.account_type, AccountType::Margin);
+        assert!(!state.balances.is_empty());
+        assert_eq!(state.margins.len(), 0);
+    }
+
+    #[rstest]
+    fn test_account_info_to_account_state_with_margins() {
+        let json = r#"{
+            "totalInitialMargin": "500.25000000",
+            "totalMaintMargin": "250.75000000",
+            "totalWalletBalance": "10000.00000000",
+            "assets": [{
+                "asset": "USDT",
+                "walletBalance": "10000.00000000",
+                "availableBalance": "9500.00000000",
+                "updateTime": 1617939110373
+            }],
+            "positions": []
+        }"#;
+        let account: BinanceFuturesAccountInfo =
+            serde_json::from_str(json).expect("Failed to parse account info");
+
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+        let state = account.to_account_state(account_id, ts_init).unwrap();
+
+        assert_eq!(state.margins.len(), 1);
+        let margin = &state.margins[0];
+        assert_eq!(margin.instrument_id.symbol.as_str(), "ACCOUNT");
+        assert_eq!(margin.instrument_id.venue.as_str(), "BINANCE");
+        assert_eq!(margin.initial.as_f64(), 500.25);
+        assert_eq!(margin.maintenance.as_f64(), 250.75);
+    }
+
+    #[rstest]
     fn test_parse_position_risk() {
+        let json = load_fixture_string("futures/http_json/position_risk.json");
         let positions: Vec<BinancePositionRisk> =
-            serde_json::from_str(POSITION_RISK_JSON).expect("Failed to parse position risk");
+            serde_json::from_str(&json).expect("Failed to parse position risk");
 
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].symbol.as_str(), "BTCUSDT");
@@ -1481,8 +1405,9 @@ mod tests {
     #[rstest]
     fn test_parse_balance_with_v1_field() {
         // V1 uses 'balance' field
+        let json = load_fixture_string("futures/http_json/balance.json");
         let balances: Vec<BinanceFuturesBalance> =
-            serde_json::from_str(BALANCE_JSON).expect("Failed to parse balance");
+            serde_json::from_str(&json).expect("Failed to parse balance");
 
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].asset.as_str(), "USDT");
@@ -1510,8 +1435,9 @@ mod tests {
 
     #[rstest]
     fn test_parse_order() {
+        let json = load_fixture_string("futures/http_json/order_response.json");
         let order: BinanceFuturesOrder =
-            serde_json::from_str(ORDER_JSON).expect("Failed to parse order");
+            serde_json::from_str(&json).expect("Failed to parse order");
 
         assert_eq!(order.order_id, 12345678);
         assert_eq!(order.symbol.as_str(), "BTCUSDT");
@@ -1658,7 +1584,7 @@ mod tests {
             "orderId": 12345678,
             "symbol": "BTCUSDT",
             "status": "NEW",
-            "clientOrderId": "x-TD67BGP9-T0000000000000",
+            "clientOrderId": "x-aHRE4BCj-T0000000000000",
             "price": "50000.00",
             "avgPrice": "0.00",
             "origQty": "0.001",
@@ -1700,7 +1626,7 @@ mod tests {
     fn test_algo_order_to_report_decodes_broker_id() {
         let json = r#"{
             "algoId": 123456789,
-            "clientAlgoId": "x-TD67BGP9-Rmy-algo-order-1",
+            "clientAlgoId": "x-aHRE4BCj-Rmy-algo-order-1",
             "algoType": "CONDITIONAL",
             "type": "STOP_MARKET",
             "symbol": "BTCUSDT",

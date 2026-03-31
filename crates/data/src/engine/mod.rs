@@ -59,7 +59,8 @@ use nautilus_common::{
         SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth10, SubscribeBookSnapshots,
         SubscribeCommand, SubscribeOptionChain, UnsubscribeBars, UnsubscribeBookDeltas,
         UnsubscribeBookDepth10, UnsubscribeBookSnapshots, UnsubscribeCommand,
-        UnsubscribeOptionChain, UnsubscribeOptionGreeks, UnsubscribeQuotes,
+        UnsubscribeInstrumentStatus, UnsubscribeOptionChain, UnsubscribeOptionGreeks,
+        UnsubscribeQuotes,
     },
     msgbus::{
         self, MStr, ShareableMessageHandler, Topic, TypedHandler, TypedIntoHandler,
@@ -120,6 +121,7 @@ use crate::{
 pub(crate) enum DeferredCommand {
     Subscribe(SubscribeCommand),
     Unsubscribe(UnsubscribeCommand),
+    ExpireSeries(OptionSeriesId),
 }
 
 /// Shared queue for deferred subscribe/unsubscribe commands.
@@ -1243,25 +1245,63 @@ impl DataEngine {
     /// managers (or any other component) and executes them against the appropriate
     /// data client.
     fn drain_deferred_commands(&mut self) {
-        let commands: VecDeque<DeferredCommand> =
-            std::mem::take(&mut *self.deferred_cmd_queue.borrow_mut());
+        // Loop because expire_series pushes Unsubscribe commands; converges in <= 3 iterations
+        loop {
+            let commands: VecDeque<DeferredCommand> =
+                std::mem::take(&mut *self.deferred_cmd_queue.borrow_mut());
 
-        for cmd in commands {
-            match cmd {
-                DeferredCommand::Subscribe(sub) => {
-                    let client = self.get_client(sub.client_id(), sub.venue());
-                    if let Some(client) = client {
-                        client.execute_subscribe(&sub);
+            if commands.is_empty() {
+                break;
+            }
+
+            for cmd in commands {
+                match cmd {
+                    DeferredCommand::Subscribe(sub) => {
+                        let client = self.get_client(sub.client_id(), sub.venue());
+                        if let Some(client) = client {
+                            client.execute_subscribe(&sub);
+                        }
                     }
-                }
-                DeferredCommand::Unsubscribe(unsub) => {
-                    let client = self.get_client(unsub.client_id(), unsub.venue());
-                    if let Some(client) = client {
-                        client.execute_unsubscribe(&unsub);
+                    DeferredCommand::Unsubscribe(unsub) => {
+                        let client = self.get_client(unsub.client_id(), unsub.venue());
+                        if let Some(client) = client {
+                            client.execute_unsubscribe(&unsub);
+                        }
+                    }
+                    DeferredCommand::ExpireSeries(series_id) => {
+                        self.expire_series(series_id);
                     }
                 }
             }
         }
+    }
+
+    /// Proactively expires all instruments for a series and tears down the manager.
+    ///
+    /// `handle_instrument_expired` removes each instrument from the aggregator and pushes
+    /// deferred unsubscribe commands. `teardown` then cancels the snapshot timer and clears
+    /// the handler lists (the aggregator is already empty at that point).
+    fn expire_series(&mut self, series_id: OptionSeriesId) {
+        let Some(manager_rc) = self.option_chain_managers.get(&series_id).cloned() else {
+            return;
+        };
+
+        let instrument_ids: Vec<InstrumentId> = self
+            .option_chain_instrument_index
+            .iter()
+            .filter(|(_, sid)| **sid == series_id)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for id in &instrument_ids {
+            self.option_chain_instrument_index.remove(id);
+            manager_rc.borrow_mut().handle_instrument_expired(id);
+        }
+
+        manager_rc.borrow_mut().teardown(&self.clock);
+        self.option_chain_managers.remove(&series_id);
+
+        log::info!("Proactively torn down expired option chain {series_id}");
     }
 
     // -- SUBSCRIPTION HANDLERS -------------------------------------------------------------------
@@ -1697,6 +1737,17 @@ impl DataEngine {
             )));
             client.execute_unsubscribe(&UnsubscribeCommand::OptionGreeks(
                 UnsubscribeOptionGreeks::new(
+                    *instrument_id,
+                    client_id,
+                    Some(venue),
+                    UUID4::new(),
+                    ts_init,
+                    None,
+                    None,
+                ),
+            ));
+            client.execute_unsubscribe(&UnsubscribeCommand::InstrumentStatus(
+                UnsubscribeInstrumentStatus::new(
                     *instrument_id,
                     client_id,
                     Some(venue),

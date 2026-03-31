@@ -54,6 +54,11 @@ pub mod config;
 pub mod data;
 pub mod data_types;
 pub mod execution;
+pub mod factories;
 pub mod http;
+pub mod loader;
 pub mod provider;
 pub mod stream;
+
+#[cfg(feature = "python")]
+pub mod python;

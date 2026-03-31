@@ -21,10 +21,14 @@ You can find live example scripts [here](https://github.com/nautechsystems/nauti
 | Perpetual Swaps   | ✓         | ✓       | Linear and inverse contracts.                    |
 | Futures           | ✓         | ✓       | Specific expiration dates.                       |
 | Margin            | ✓         | ✓       | Spot trading with margin/leverage (spot margin). |
-| Options           | ✓         | -       | *Data feed supported, trading coming soon*.      |
+| Options           | ✓         | -       | Data, greeks; *trading coming soon*.             |
 
 :::note
-**Options support**: While you can subscribe to options market data and receive price updates, order execution for options is not yet implemented. You can use the symbology format shown above to subscribe to options data feeds.
+**Options support**: You can subscribe to options market data, venue-provided Greeks
+(`subscribe_option_greeks`), and receive real-time delta, gamma, vega, theta, and
+implied volatility updates via the OKX `opt-summary` channel. Order execution for
+options is not yet implemented. See the [Options](../concepts/options.md) guide for
+subscription patterns.
 :::
 
 :::info
@@ -175,26 +179,16 @@ When using spot margin trading (`use_spot_margin=True`), OKX interprets order qu
 - **Market BUY** orders interpret `quantity` as quote notional (e.g., USDT).
 
 :::warning
-**When submitting spot margin market BUY orders, you must**:
+**When submitting spot margin market BUY orders**, set `quote_quantity=True` on the order (or
+pre-compute the quote-denominated amount). The OKX execution client denies base-denominated
+market buy orders for spot margin to prevent unintended fills.
 
-1. Set `quote_quantity=True` on the order (or pre-compute the quote-denominated amount).
-2. Configure the execution engine with `convert_quote_qty_to_base=False` so the quote amount reaches the adapter unchanged.
-
-The OKX execution client will deny base-denominated market buy orders for spot margin to prevent unintended fills.
-
-**On the first fill**, the order quantity will be automatically updated from the quote quantity to the actual base quantity received,
-reflecting the executed trade.
+**On the first fill**, the order quantity is automatically updated from the quote quantity to the
+actual base quantity received, reflecting the executed trade.
 :::
 
 ```python
-from nautilus_trader.execution.config import ExecEngineConfig
-from nautilus_trader.execution.engine import ExecutionEngine
-
-# Disable automatic conversion for quote quantities
-config = ExecEngineConfig(convert_quote_qty_to_base=False)
-engine = ExecutionEngine(msgbus=msgbus, cache=cache, clock=clock, config=config)
-
-# Correct: Spot margin market BUY with quote quantity (spend $100 USDT)
+# Spot margin market BUY with quote quantity (spend $100 USDT)
 order = strategy.order_factory.market(
     instrument_id=instrument_id,
     order_side=OrderSide.BUY,
@@ -382,7 +376,7 @@ Only use manual override if you have specific requirements that cannot be met th
 
 | Feature             | Linear Perpetual Swap | Notes                                      |
 |---------------------|-----------------------|--------------------------------------------|
-| Order lists         | -                     | *Not supported*.                           |
+| Order lists         | ✓                     | Batch via WS; regular orders only.         |
 | OCO orders          | ✓                     | One-Cancels-Other orders.                  |
 | Bracket orders      | ✓                     | Stop loss + take profit combinations.      |
 | Conditional orders  | ✓                     | Stop and limit-if-touched orders.          |
@@ -513,6 +507,18 @@ When demo mode is enabled:
 :::note
 Demo API keys are separate from production keys. You must create API keys specifically for demo trading through the Demo Trading interface. Production API keys will not work in demo mode.
 :::
+
+## Funding rates
+
+The adapter receives funding rate data from the
+[Funding Rate Channel](https://www.okx.com/docs-v5/en/#public-data-websocket-funding-rate-channel)
+WebSocket stream. OKX provides both `fundingTime` and `nextFundingTime` in each message,
+and the adapter computes `interval` as the difference between these two values.
+
+For historical funding rate requests, the adapter computes the interval from consecutive
+funding timestamps returned by the
+[Get Funding Rate History](https://www.okx.com/docs-v5/en/#public-data-rest-api-get-funding-rate-history)
+endpoint.
 
 ## Rate limiting
 

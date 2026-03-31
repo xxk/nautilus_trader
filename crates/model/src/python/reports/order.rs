@@ -36,7 +36,9 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderStatusReport {
+    /// Represents an order status at a point in time.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (

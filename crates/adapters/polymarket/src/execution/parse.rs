@@ -13,23 +13,26 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Parsing functions for Polymarket execution reports and order building.
+//! Parsing functions for Polymarket execution reports.
 
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     enums::{LiquiditySide, OrderSide, OrderStatus, OrderType, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
     reports::{FillReport, OrderStatusReport},
-    types::{Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 
 use crate::{
     common::{
-        enums::{PolymarketLiquiditySide, PolymarketOrderSide},
+        enums::{
+            PolymarketEventType, PolymarketLiquiditySide, PolymarketOrderSide,
+            PolymarketOrderStatus,
+        },
         models::PolymarketMakerOrder,
     },
-    http::models::{PolymarketOpenOrder, PolymarketTradeReport},
+    http::models::{ClobBookLevel, PolymarketOpenOrder, PolymarketTradeReport},
 };
 
 /// Converts a [`PolymarketLiquiditySide`] to a Nautilus [`LiquiditySide`].
@@ -37,6 +40,21 @@ pub const fn parse_liquidity_side(side: PolymarketLiquiditySide) -> LiquiditySid
     match side {
         PolymarketLiquiditySide::Maker => LiquiditySide::Maker,
         PolymarketLiquiditySide::Taker => LiquiditySide::Taker,
+    }
+}
+
+/// Resolves the Nautilus order status from Polymarket status and event type.
+///
+/// Venue-initiated cancellations arrive as `status=Invalid, event_type=Cancellation`
+/// (e.g. sport market resolution). These map to `Canceled`, not `Rejected`.
+pub fn resolve_order_status(
+    status: PolymarketOrderStatus,
+    event_type: PolymarketEventType,
+) -> OrderStatus {
+    if status == PolymarketOrderStatus::Invalid && event_type == PolymarketEventType::Cancellation {
+        OrderStatus::Canceled
+    } else {
+        OrderStatus::from(status)
     }
 }
 
@@ -258,35 +276,114 @@ pub fn compute_commission(fee_rate_bps: Decimal, size: Decimal, price: Decimal) 
     commission.to_string().parse().unwrap_or(0.0)
 }
 
-/// Builds the maker/taker amounts for a Polymarket CLOB order.
+/// USDC scale factor: the Polymarket API returns balances in micro-USDC (10^6 units).
+const USDC_SCALE: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
+
+/// Converts a raw micro-USDC balance from the Polymarket API into an [`AccountBalance`].
 ///
-/// Returns `(maker_amount, taker_amount)` in on-chain base units (USDC 10^6 / CTF shares 10^6).
+/// The API returns balances as integer micro-USDC (e.g. `20000000` = 20 USDC).
+/// This divides by 10^6 and constructs Money via `Money::from_decimal`, matching
+/// the pattern used by dYdX, Deribit, OKX, and other adapters.
+pub fn parse_balance_allowance(
+    balance_raw: Decimal,
+    currency: Currency,
+) -> anyhow::Result<AccountBalance> {
+    let balance_usdc = balance_raw / USDC_SCALE;
+    let total = Money::from_decimal(balance_usdc, currency)
+        .map_err(|e| anyhow::anyhow!("Failed to convert balance: {e}"))?;
+    let locked = Money::new(0.0, currency);
+    let free = total;
+    Ok(AccountBalance::new(total, locked, free))
+}
+
+/// Result of walking the order book to compute market order parameters.
+#[derive(Debug)]
+pub struct MarketPriceResult {
+    /// The crossing price (worst level reached) for the signed CLOB order.
+    pub crossing_price: Decimal,
+    /// Expected base quantity (shares) computed by walking levels at actual prices.
+    pub expected_base_qty: Decimal,
+}
+
+/// Calculates the market-crossing price and expected base quantity by walking the order book.
 ///
-/// For BUY: paying USDC (maker) to receive CTF shares (taker)
-///   - `maker_amount = qty * price * 10^6`
-///   - `taker_amount = qty * 10^6`
+/// Sorts levels deterministically before walking:
+/// - BUY (asks): ascending by price, best (lowest) ask first
+/// - SELL (bids): descending by price, best (highest) bid first
 ///
-/// For SELL: paying CTF shares (maker) to receive USDC (taker)
-///   - `maker_amount = qty * 10^6`
-///   - `taker_amount = qty * price * 10^6`
-pub fn compute_maker_taker_amounts(
-    price: Decimal,
-    quantity: Decimal,
+/// This ensures correct results regardless of the CLOB API's response ordering.
+///
+/// For BUY: walks asks best-first, accumulates `size * price` (USDC) until >= amount.
+///          Also accumulates the exact shares at each level for precise base qty.
+/// For SELL: walks bids best-first, accumulates `size` (shares) until >= amount.
+///
+/// Returns the crossing price and expected base quantity. If insufficient liquidity,
+/// uses all available levels. If the book side is empty, returns an error.
+pub fn calculate_market_price(
+    book_levels: &[ClobBookLevel],
+    amount: Decimal,
     side: PolymarketOrderSide,
-) -> (Decimal, Decimal) {
-    let scale = Decimal::new(1_000_000, 0);
+) -> anyhow::Result<MarketPriceResult> {
+    if book_levels.is_empty() {
+        anyhow::bail!("Empty order book: no liquidity available for market order");
+    }
+
+    // Parse and sort levels deterministically so we never depend on API ordering.
+    // BUY: asks ascending (best/lowest first). SELL: bids descending (best/highest first).
+    let mut parsed_levels: Vec<(Decimal, Decimal)> = book_levels
+        .iter()
+        .map(|l| {
+            let price = Decimal::from_str_exact(&l.price).unwrap_or(Decimal::ZERO);
+            let size = Decimal::from_str_exact(&l.size).unwrap_or(Decimal::ZERO);
+            (price, size)
+        })
+        .filter(|(p, s)| !p.is_zero() && !s.is_zero())
+        .collect();
+
+    if parsed_levels.is_empty() {
+        anyhow::bail!("Empty order book: no valid price levels for market order");
+    }
+
     match side {
-        PolymarketOrderSide::Buy => {
-            let maker_amount = quantity * price * scale;
-            let taker_amount = quantity * scale;
-            (maker_amount, taker_amount)
+        PolymarketOrderSide::Buy => parsed_levels.sort_by(|a, b| a.0.cmp(&b.0)),
+        PolymarketOrderSide::Sell => parsed_levels.sort_by(|a, b| b.0.cmp(&a.0)),
+    }
+
+    let mut remaining = amount;
+    let mut last_price = Decimal::ZERO;
+    let mut total_base_qty = Decimal::ZERO;
+
+    for &(price, size) in &parsed_levels {
+        last_price = price;
+
+        match side {
+            PolymarketOrderSide::Buy => {
+                let level_usdc = size * price;
+                let consumed_usdc = level_usdc.min(remaining);
+                let shares_at_level = consumed_usdc / price;
+                total_base_qty += shares_at_level;
+                remaining -= consumed_usdc;
+            }
+            PolymarketOrderSide::Sell => {
+                let consumed_shares = size.min(remaining);
+                total_base_qty += consumed_shares;
+                remaining -= consumed_shares;
+            }
         }
-        PolymarketOrderSide::Sell => {
-            let maker_amount = quantity * scale;
-            let taker_amount = quantity * price * scale;
-            (maker_amount, taker_amount)
+
+        if remaining <= Decimal::ZERO {
+            return Ok(MarketPriceResult {
+                crossing_price: last_price,
+                expected_base_qty: total_base_qty,
+            });
         }
     }
+
+    // Insufficient liquidity: return what we have (FOK will reject at venue)
+    Ok(MarketPriceResult {
+        crossing_price: last_price,
+        expected_base_qty: total_base_qty,
+    })
 }
 
 /// Parses a timestamp string into [`UnixNanos`].
@@ -315,19 +412,20 @@ mod tests {
     use crate::common::enums::PolymarketOrderSide;
 
     #[rstest]
-    #[case(dec!(0.50), dec!(100), PolymarketOrderSide::Buy, dec!(50_000_000), dec!(100_000_000))]
-    #[case(dec!(0.50), dec!(100), PolymarketOrderSide::Sell, dec!(100_000_000), dec!(50_000_000))]
-    #[case(dec!(0.75), dec!(200), PolymarketOrderSide::Buy, dec!(150_000_000), dec!(200_000_000))]
-    fn test_compute_maker_taker_amounts(
-        #[case] price: Decimal,
-        #[case] quantity: Decimal,
-        #[case] side: PolymarketOrderSide,
-        #[case] expected_maker: Decimal,
-        #[case] expected_taker: Decimal,
-    ) {
-        let (maker, taker) = compute_maker_taker_amounts(price, quantity, side);
-        assert_eq!(maker, expected_maker);
-        assert_eq!(taker, expected_taker);
+    #[case(dec!(20_000_000), 20.0)] // 20 USDC
+    #[case(dec!(1_000_000), 1.0)] // 1 USDC
+    #[case(dec!(500_000), 0.5)] // 0.5 USDC
+    #[case(dec!(0), 0.0)] // zero
+    #[case(dec!(123_456_789), 123.456789)] // fractional
+    fn test_parse_balance_allowance(#[case] raw: Decimal, #[case] expected: f64) {
+        let currency = Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto);
+        let balance = parse_balance_allowance(raw, currency).unwrap();
+        let total_f64: f64 = balance.total.as_decimal().to_string().parse().unwrap();
+        assert!(
+            (total_f64 - expected).abs() < 1e-8,
+            "expected {expected}, was {total_f64}"
+        );
+        assert_eq!(balance.free, balance.total);
     }
 
     #[rstest]
@@ -509,5 +607,211 @@ mod tests {
         let id_a = make_composite_trade_id("same-trade", "order-aaa");
         let id_b = make_composite_trade_id("same-trade", "order-bbb");
         assert_ne!(id_a, id_b);
+    }
+
+    // Tests use various input orderings to prove the function sorts deterministically.
+
+    #[rstest]
+    fn test_calculate_market_price_buy_single_level() {
+        let levels = vec![ClobBookLevel {
+            price: "0.55".to_string(),
+            size: "200.0".to_string(),
+        }];
+        let result = calculate_market_price(&levels, dec!(50), PolymarketOrderSide::Buy).unwrap();
+        assert_eq!(result.crossing_price, dec!(0.55));
+        // 50 USDC / 0.55 per share = ~90.909 shares
+        assert!(result.expected_base_qty > dec!(90));
+    }
+
+    #[rstest]
+    fn test_calculate_market_price_buy_walks_multiple_levels() {
+        // Asks in arbitrary order, function sorts ascending for BUY
+        let levels = vec![
+            ClobBookLevel {
+                price: "0.55".to_string(),
+                size: "100.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.50".to_string(),
+                size: "10.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.60".to_string(),
+                size: "200.0".to_string(),
+            },
+        ];
+        // Sorted ascending: 0.50/10, 0.55/100, 0.60/200
+        // Walk: 0.50/10 → 5 USDC (10 shares), 0.55/100 → 15 USDC (27.27 shares)
+        let result = calculate_market_price(&levels, dec!(20), PolymarketOrderSide::Buy).unwrap();
+        assert_eq!(result.crossing_price, dec!(0.55));
+        let expected = dec!(10) + dec!(15) / dec!(0.55);
+        assert_eq!(result.expected_base_qty, expected);
+    }
+
+    #[rstest]
+    fn test_calculate_market_price_buy_small_order_uses_best_ask() {
+        // Asks in mixed order, function sorts to find best (0.20) first
+        let levels = vec![
+            ClobBookLevel {
+                price: "0.50".to_string(),
+                size: "50.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.999".to_string(),
+                size: "100.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.20".to_string(),
+                size: "72.0".to_string(),
+            },
+        ];
+        // Sorted ascending: 0.20/72, 0.50/50, 0.999/100
+        // 5 USDC at best ask 0.20: 72 * 0.20 = 14.4 USDC available, fills entirely
+        let result = calculate_market_price(&levels, dec!(5), PolymarketOrderSide::Buy).unwrap();
+        assert_eq!(result.crossing_price, dec!(0.20));
+        assert_eq!(result.expected_base_qty, dec!(25)); // 5 / 0.20 = 25 shares
+    }
+
+    #[rstest]
+    fn test_calculate_market_price_sell_walks_levels() {
+        // Bids in ascending order, function sorts descending for SELL (best bid first)
+        let levels = vec![
+            ClobBookLevel {
+                price: "0.48".to_string(),
+                size: "100.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.50".to_string(),
+                size: "50.0".to_string(),
+            },
+        ];
+        // Sorted descending: 0.50/50, 0.48/100
+        // Walk: 0.50 gives 50, need 30 more from 0.48 → fills
+        let result = calculate_market_price(&levels, dec!(80), PolymarketOrderSide::Sell).unwrap();
+        assert_eq!(result.crossing_price, dec!(0.48));
+        assert_eq!(result.expected_base_qty, dec!(80));
+    }
+
+    #[rstest]
+    fn test_calculate_market_price_empty_book() {
+        let levels: Vec<ClobBookLevel> = vec![];
+        let result = calculate_market_price(&levels, dec!(50), PolymarketOrderSide::Buy);
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_calculate_market_price_all_zero_levels_returns_error() {
+        let levels = vec![
+            ClobBookLevel {
+                price: "0".to_string(),
+                size: "100.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.50".to_string(),
+                size: "0".to_string(),
+            },
+        ];
+        let result = calculate_market_price(&levels, dec!(50), PolymarketOrderSide::Buy);
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_calculate_market_price_insufficient_liquidity_returns_worst() {
+        let levels = vec![ClobBookLevel {
+            price: "0.55".to_string(),
+            size: "10.0".to_string(),
+        }];
+        // 10 * 0.55 = 5.5 USDC < 50 USDC needed, returns what's available
+        let result = calculate_market_price(&levels, dec!(50), PolymarketOrderSide::Buy).unwrap();
+        assert_eq!(result.crossing_price, dec!(0.55));
+        assert_eq!(result.expected_base_qty, dec!(10)); // only 10 shares available
+    }
+
+    #[rstest]
+    fn test_calculate_market_price_buy_order_independent_of_input_ordering() {
+        let levels_ascending = vec![
+            ClobBookLevel {
+                price: "0.20".to_string(),
+                size: "72.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.50".to_string(),
+                size: "50.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.999".to_string(),
+                size: "100.0".to_string(),
+            },
+        ];
+        let levels_descending = vec![
+            ClobBookLevel {
+                price: "0.999".to_string(),
+                size: "100.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.50".to_string(),
+                size: "50.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.20".to_string(),
+                size: "72.0".to_string(),
+            },
+        ];
+        let levels_shuffled = vec![
+            ClobBookLevel {
+                price: "0.50".to_string(),
+                size: "50.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.20".to_string(),
+                size: "72.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.999".to_string(),
+                size: "100.0".to_string(),
+            },
+        ];
+
+        let r1 =
+            calculate_market_price(&levels_ascending, dec!(20), PolymarketOrderSide::Buy).unwrap();
+        let r2 =
+            calculate_market_price(&levels_descending, dec!(20), PolymarketOrderSide::Buy).unwrap();
+        let r3 =
+            calculate_market_price(&levels_shuffled, dec!(20), PolymarketOrderSide::Buy).unwrap();
+
+        assert_eq!(r1.crossing_price, r2.crossing_price);
+        assert_eq!(r2.crossing_price, r3.crossing_price);
+        assert_eq!(r1.expected_base_qty, r2.expected_base_qty);
+        assert_eq!(r2.expected_base_qty, r3.expected_base_qty);
+    }
+
+    #[rstest]
+    fn test_calculate_market_price_sell_order_independent_of_input_ordering() {
+        let levels_a = vec![
+            ClobBookLevel {
+                price: "0.48".to_string(),
+                size: "100.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.50".to_string(),
+                size: "50.0".to_string(),
+            },
+        ];
+        let levels_b = vec![
+            ClobBookLevel {
+                price: "0.50".to_string(),
+                size: "50.0".to_string(),
+            },
+            ClobBookLevel {
+                price: "0.48".to_string(),
+                size: "100.0".to_string(),
+            },
+        ];
+
+        let r1 = calculate_market_price(&levels_a, dec!(80), PolymarketOrderSide::Sell).unwrap();
+        let r2 = calculate_market_price(&levels_b, dec!(80), PolymarketOrderSide::Sell).unwrap();
+
+        assert_eq!(r1.crossing_price, r2.crossing_price);
+        assert_eq!(r1.expected_base_qty, r2.expected_base_qty);
     }
 }

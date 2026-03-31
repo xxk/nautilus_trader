@@ -17,7 +17,7 @@
 
 use std::fmt::Display;
 
-use nautilus_model::enums::{OrderSide, OrderType, TimeInForce};
+use nautilus_model::enums::{MarketStatusAction, OrderSide, OrderType, TimeInForce};
 use serde::{Deserialize, Serialize};
 
 /// Binance product type identifier.
@@ -34,6 +34,10 @@ use serde::{Deserialize, Serialize};
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE"
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.binance")
 )]
 pub enum BinanceProductType {
     /// Spot trading (api.binance.com).
@@ -122,6 +126,10 @@ impl Display for BinanceProductType {
         rename_all = "SCREAMING_SNAKE_CASE"
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.binance")
+)]
 pub enum BinanceEnvironment {
     /// Production/mainnet environment.
     #[default]
@@ -187,6 +195,10 @@ impl From<BinanceSide> for OrderSide {
         eq,
         from_py_object
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.binance")
 )]
 pub enum BinancePositionSide {
     /// Single position mode (both).
@@ -457,6 +469,23 @@ pub enum BinanceTradingStatus {
     Unknown,
 }
 
+impl From<BinanceTradingStatus> for MarketStatusAction {
+    fn from(status: BinanceTradingStatus) -> Self {
+        match status {
+            BinanceTradingStatus::Trading => Self::Trading,
+            BinanceTradingStatus::PendingTrading | BinanceTradingStatus::PreTrading => {
+                Self::PreOpen
+            }
+            BinanceTradingStatus::PostTrading => Self::PostClose,
+            BinanceTradingStatus::EndOfDay => Self::Close,
+            BinanceTradingStatus::Halt => Self::Halt,
+            BinanceTradingStatus::AuctionMatch => Self::Cross,
+            BinanceTradingStatus::Break => Self::Pause,
+            BinanceTradingStatus::Unknown => Self::NotAvailableForTrading,
+        }
+    }
+}
+
 /// Contract status for coin-margined futures.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -480,6 +509,23 @@ pub enum BinanceContractStatus {
     /// Unknown or undocumented value.
     #[serde(other)]
     Unknown,
+}
+
+impl From<BinanceContractStatus> for MarketStatusAction {
+    fn from(status: BinanceContractStatus) -> Self {
+        match status {
+            BinanceContractStatus::Trading => Self::Trading,
+            BinanceContractStatus::PendingTrading => Self::PreOpen,
+            BinanceContractStatus::PreDelivering | BinanceContractStatus::PreDelisting => {
+                Self::PreClose
+            }
+            BinanceContractStatus::Delivering | BinanceContractStatus::Delivered => Self::Close,
+            BinanceContractStatus::Delisting => Self::Suspend,
+            BinanceContractStatus::Down | BinanceContractStatus::Unknown => {
+                Self::NotAvailableForTrading
+            }
+        }
+    }
 }
 
 /// WebSocket stream event types.

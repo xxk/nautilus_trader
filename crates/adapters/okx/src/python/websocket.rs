@@ -43,11 +43,11 @@
 
 use std::str::FromStr;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use futures_util::StreamExt;
-use nautilus_common::live::get_runtime;
+use nautilus_common::{cache::quote::QuoteCache, live::get_runtime};
 use nautilus_core::{
-    UUID4,
+    UUID4, UnixNanos,
     python::{call_python_threadsafe, to_pyruntime_err, to_pyvalue_err},
     time::{AtomicTime, get_atomic_clock_realtime},
 };
@@ -63,16 +63,17 @@ use nautilus_model::{
     },
     types::{Money, Price, Quantity},
 };
-use pyo3::{IntoPyObjectExt, prelude::*};
+use pyo3::{IntoPyObjectExt, prelude::*, types::PyDict};
 use ustr::Ustr;
 
+use super::{extract_optional_string, extract_optional_trigger_type};
 use crate::{
     common::{
         enums::{OKXBookAction, OKXInstrumentStatus, OKXInstrumentType, OKXTradeMode, OKXVipLevel},
         models::OKXInstrument,
         parse::{
             okx_status_to_market_action, parse_account_state, parse_instrument_any,
-            parse_position_status_report,
+            parse_millisecond_timestamp, parse_position_status_report, parse_price, parse_quantity,
         },
     },
     http::models::{OKXAccount, OKXPosition},
@@ -80,15 +81,66 @@ use crate::{
         OKXWebSocketClient,
         enums::{OKXWsChannel, OKXWsOperation},
         messages::{
-            ExecutionReport, NautilusWsMessage, OKXAlgoOrderMsg, OKXBookMsg, OKXOrderMsg,
-            OKXWebSocketError, OKXWsMessage,
+            ExecutionReport, NautilusWsMessage, OKXAlgoOrderMsg, OKXBookMsg, OKXOptionSummaryMsg,
+            OKXOrderMsg, OKXWebSocketError, OKXWsMessage, WsAttachAlgoOrdParams,
+            WsAttachAlgoOrdParamsBuilder,
         },
         parse::{
             extract_fees_from_cached_instrument, parse_algo_order_msg, parse_book_msg_vec,
-            parse_index_price_msg_vec, parse_order_msg_vec, parse_ws_message_data,
+            parse_index_price_msg_vec, parse_option_summary_greeks, parse_order_msg_vec,
+            parse_ws_message_data,
         },
     },
 };
+
+fn parse_attach_algo_ords(
+    py: Python<'_>,
+    attach_algo_ords: Option<Vec<Py<PyDict>>>,
+) -> PyResult<Option<Vec<WsAttachAlgoOrdParams>>> {
+    attach_algo_ords
+        .map(|items| {
+            items
+                .into_iter()
+                .map(|item| {
+                    let dict = item.bind(py);
+                    let mut builder = WsAttachAlgoOrdParamsBuilder::default();
+
+                    if let Some(value) = extract_optional_string(dict, "attach_algo_cl_ord_id")? {
+                        builder.attach_algo_cl_ord_id(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "sl_trigger_px")? {
+                        builder.sl_trigger_px(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "sl_ord_px")? {
+                        builder.sl_ord_px(value);
+                    }
+
+                    if let Some(value) = extract_optional_trigger_type(dict, "sl_trigger_px_type")?
+                    {
+                        builder.sl_trigger_px_type(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "tp_trigger_px")? {
+                        builder.tp_trigger_px(value);
+                    }
+
+                    if let Some(value) = extract_optional_string(dict, "tp_ord_px")? {
+                        builder.tp_ord_px(value);
+                    }
+
+                    if let Some(value) = extract_optional_trigger_type(dict, "tp_trigger_px_type")?
+                    {
+                        builder.tp_trigger_px_type(value);
+                    }
+
+                    builder.build().map_err(to_pyvalue_err)
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()
+}
 
 #[pyo3::pymethods]
 impl OKXWebSocketError {
@@ -121,9 +173,11 @@ impl OKXWebSocketError {
 }
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OKXWebSocketClient {
+    /// Provides a WebSocket client for connecting to [OKX](https://okx.com).
     #[new]
-    #[pyo3(signature = (url=None, api_key=None, api_secret=None, api_passphrase=None, account_id=None, heartbeat=None))]
+    #[pyo3(signature = (url=None, api_key=None, api_secret=None, api_passphrase=None, account_id=None, heartbeat=None, auth_timeout_secs=None))]
     fn py_new(
         url: Option<String>,
         api_key: Option<String>,
@@ -131,6 +185,7 @@ impl OKXWebSocketClient {
         api_passphrase: Option<String>,
         account_id: Option<AccountId>,
         heartbeat: Option<u64>,
+        auth_timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
         Self::new(
             url,
@@ -139,13 +194,14 @@ impl OKXWebSocketClient {
             api_passphrase,
             account_id,
             heartbeat,
+            auth_timeout_secs,
         )
         .map_err(to_pyvalue_err)
     }
 
     #[staticmethod]
     #[pyo3(name = "with_credentials")]
-    #[pyo3(signature = (url=None, api_key=None, api_secret=None, api_passphrase=None, account_id=None, heartbeat=None))]
+    #[pyo3(signature = (url=None, api_key=None, api_secret=None, api_passphrase=None, account_id=None, heartbeat=None, auth_timeout_secs=None))]
     fn py_with_credentials(
         url: Option<String>,
         api_key: Option<String>,
@@ -153,6 +209,7 @@ impl OKXWebSocketClient {
         api_passphrase: Option<String>,
         account_id: Option<AccountId>,
         heartbeat: Option<u64>,
+        auth_timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
         Self::with_credentials(
             url,
@@ -161,6 +218,7 @@ impl OKXWebSocketClient {
             api_passphrase,
             account_id,
             heartbeat,
+            auth_timeout_secs,
         )
         .map_err(to_pyvalue_err)
     }
@@ -268,9 +326,11 @@ impl OKXWebSocketClient {
             get_runtime().spawn(async move {
                 let account_id = client.account_id;
                 let mut instruments_by_symbol = client.instruments_snapshot();
+                let mut quote_cache = QuoteCache::new();
                 let mut funding_cache: AHashMap<Ustr, (Ustr, u64)> = AHashMap::new();
                 let mut fee_cache: AHashMap<Ustr, Money> = AHashMap::new();
                 let mut filled_qty_cache: AHashMap<Ustr, Quantity> = AHashMap::new();
+                let option_greeks_subs_arc = client.option_greeks_subs().clone();
                 let _client = client;
                 tokio::pin!(stream);
 
@@ -292,12 +352,15 @@ impl OKXWebSocketClient {
                             inst_id,
                             data,
                         } => {
+                            let greeks_guard = option_greeks_subs_arc.load();
                             handle_channel_data(
                                 &channel,
                                 inst_id,
                                 data,
                                 &mut instruments_by_symbol,
+                                &mut quote_cache,
                                 &mut funding_cache,
+                                &greeks_guard,
                                 clock,
                                 &call_soon,
                                 &callback,
@@ -388,7 +451,10 @@ impl OKXWebSocketClient {
                         OKXWsMessage::Error(msg) => {
                             call_python_with_data(&call_soon, &callback, |py| msg.into_py_any(py));
                         }
-                        OKXWsMessage::Reconnected | OKXWsMessage::Authenticated => {}
+                        OKXWsMessage::Reconnected => {
+                            quote_cache.clear();
+                        }
+                        OKXWsMessage::Authenticated => {}
                     }
                 }
             });
@@ -797,6 +863,50 @@ impl OKXWebSocketClient {
         })
     }
 
+    #[pyo3(name = "add_option_greeks_sub")]
+    fn py_add_option_greeks_sub(&self, instrument_id: InstrumentId) {
+        self.add_option_greeks_sub(instrument_id);
+    }
+
+    #[pyo3(name = "remove_option_greeks_sub")]
+    fn py_remove_option_greeks_sub(&self, instrument_id: InstrumentId) {
+        self.remove_option_greeks_sub(&instrument_id);
+    }
+
+    #[pyo3(name = "subscribe_option_summary")]
+    fn py_subscribe_option_summary<'py>(
+        &self,
+        py: Python<'py>,
+        inst_family: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let family = Ustr::from(inst_family);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.subscribe_option_summary(family).await {
+                log::error!("Failed to subscribe to option summary: {e}");
+            }
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "unsubscribe_option_summary")]
+    fn py_unsubscribe_option_summary<'py>(
+        &self,
+        py: Python<'py>,
+        inst_family: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let family = Ustr::from(inst_family);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Err(e) = client.unsubscribe_option_summary(family).await {
+                log::error!("Failed to unsubscribe from option summary: {e}");
+            }
+            Ok(())
+        })
+    }
+
     #[pyo3(name = "subscribe_funding_rates")]
     fn py_subscribe_funding_rates<'py>(
         &self,
@@ -998,6 +1108,7 @@ impl OKXWebSocketClient {
         reduce_only=None,
         quote_quantity=None,
         position_side=None,
+        attach_algo_ords=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_submit_order<'py>(
@@ -1018,7 +1129,9 @@ impl OKXWebSocketClient {
         reduce_only: Option<bool>,
         quote_quantity: Option<bool>,
         position_side: Option<PositionSide>,
+        attach_algo_ords: Option<Vec<Py<PyDict>>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let attach_algo_ords = parse_attach_algo_ords(py, attach_algo_ords)?;
         let client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1039,6 +1152,7 @@ impl OKXWebSocketClient {
                     reduce_only,
                     quote_quantity,
                     position_side,
+                    attach_algo_ords,
                 )
                 .await
                 .map_err(to_pyvalue_err)
@@ -1335,11 +1449,47 @@ fn handle_channel_data(
     inst_id: Option<Ustr>,
     data: serde_json::Value,
     instruments_by_symbol: &mut AHashMap<Ustr, InstrumentAny>,
+    quote_cache: &mut QuoteCache,
     funding_cache: &mut AHashMap<Ustr, (Ustr, u64)>,
+    option_greeks_subs: &AHashSet<InstrumentId>,
     clock: &AtomicTime,
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
 ) {
+    if matches!(channel, OKXWsChannel::OptionSummary) {
+        let ts_init = clock.get_time_ns();
+        match serde_json::from_value::<Vec<OKXOptionSummaryMsg>>(data) {
+            Ok(msgs) => {
+                for msg in &msgs {
+                    let Some(instrument) = instruments_by_symbol.get(&msg.inst_id) else {
+                        continue;
+                    };
+                    let instrument_id = instrument.id();
+                    if !option_greeks_subs.contains(&instrument_id) {
+                        continue;
+                    }
+                    match parse_option_summary_greeks(msg, &instrument_id, ts_init) {
+                        Ok(greeks) => {
+                            Python::attach(|py| match greeks.into_py_any(py) {
+                                Ok(py_obj) => {
+                                    call_python_threadsafe(py, call_soon, callback, py_obj);
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to convert OptionGreeks to Python: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            log::error!("Failed to parse option summary for {}: {e}", msg.inst_id);
+                        }
+                    }
+                }
+            }
+            Err(e) => log::error!("Failed to deserialize option summary data: {e}"),
+        }
+        return;
+    }
+
     let Some(inst_id) = inst_id else { return };
 
     if matches!(channel, OKXWsChannel::IndexTickers) {
@@ -1379,6 +1529,20 @@ fn handle_channel_data(
     let size_precision = instrument.size_precision();
     let ts_init = clock.get_time_ns();
 
+    if matches!(channel, OKXWsChannel::BboTbt) {
+        handle_bbo_tbt(
+            data,
+            instrument_id,
+            price_precision,
+            size_precision,
+            ts_init,
+            quote_cache,
+            call_soon,
+            callback,
+        );
+        return;
+    }
+
     match parse_ws_message_data(
         channel,
         data,
@@ -1395,6 +1559,57 @@ fn handle_channel_data(
         Ok(None) => {}
         Err(e) => {
             log::error!("Failed to parse {channel:?} data: {e}");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_bbo_tbt(
+    data: serde_json::Value,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+    quote_cache: &mut QuoteCache,
+    call_soon: &Py<PyAny>,
+    callback: &Py<PyAny>,
+) {
+    let msgs: Vec<OKXBookMsg> = match serde_json::from_value(data) {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            log::error!("Failed to deserialize BboTbt data: {e}");
+            return;
+        }
+    };
+
+    for msg in &msgs {
+        let bid = msg.bids.first();
+        let ask = msg.asks.first();
+
+        let bid_price = bid.and_then(|e| parse_price(&e.price, price_precision).ok());
+        let bid_size = bid.and_then(|e| parse_quantity(&e.size, size_precision).ok());
+        let ask_price = ask.and_then(|e| parse_price(&e.price, price_precision).ok());
+        let ask_size = ask.and_then(|e| parse_quantity(&e.size, size_precision).ok());
+        let ts_event = parse_millisecond_timestamp(msg.ts);
+
+        match quote_cache.process(
+            instrument_id,
+            bid_price,
+            ask_price,
+            bid_size,
+            ask_size,
+            ts_event,
+            ts_init,
+        ) {
+            Ok(quote) => {
+                Python::attach(|py| {
+                    let py_obj = data_to_pycapsule(py, Data::Quote(quote));
+                    call_python_threadsafe(py, call_soon, callback, py_obj);
+                });
+            }
+            Err(e) => {
+                log::debug!("Skipping partial BboTbt for {instrument_id}: {e}");
+            }
         }
     }
 }

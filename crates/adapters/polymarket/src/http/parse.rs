@@ -234,6 +234,57 @@ pub fn instruments_from_defs(
         .collect()
 }
 
+/// Rebuilds an instrument with a new tick size (price precision + price increment).
+///
+/// All other fields are preserved from `existing`. Returns a new `InstrumentAny`.
+pub fn rebuild_instrument_with_tick_size(
+    existing: &InstrumentAny,
+    new_tick_size: &str,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<InstrumentAny> {
+    let bo = match existing {
+        InstrumentAny::BinaryOption(b) => b,
+        other => anyhow::bail!("Expected BinaryOption, was {other:?}"),
+    };
+
+    let tick_size: Decimal = new_tick_size
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Failed to parse tick size '{new_tick_size}': {e}"))?;
+    let price_precision = tick_size.scale() as u8;
+    let price_increment = Price::from(tick_size.to_string());
+
+    let rebuilt = BinaryOption::new_checked(
+        bo.id,
+        bo.raw_symbol,
+        bo.asset_class,
+        bo.currency,
+        bo.activation_ns,
+        bo.expiration_ns,
+        price_precision,
+        bo.size_precision,
+        price_increment,
+        bo.size_increment,
+        bo.outcome,
+        bo.description,
+        bo.max_quantity,
+        bo.min_quantity,
+        bo.max_notional,
+        bo.min_notional,
+        bo.max_price,
+        bo.min_price,
+        Some(bo.margin_init),
+        Some(bo.margin_maint),
+        Some(bo.maker_fee),
+        Some(bo.taker_fee),
+        bo.info.clone(),
+        ts_event,
+        ts_init,
+    )?;
+
+    Ok(InstrumentAny::BinaryOption(rebuilt))
+}
+
 fn build_info_json(def: &PolymarketInstrumentDef) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     map.insert(
@@ -308,8 +359,8 @@ mod tests {
         let defs = parse_gamma_market(&market).unwrap();
 
         assert_eq!(defs.len(), 2);
-        assert_eq!(defs[0].outcome, PolymarketOutcome::yes());
-        assert_eq!(defs[1].outcome, PolymarketOutcome::no());
+        assert_eq!(defs[0].outcome, PolymarketOutcome::from("Up"));
+        assert_eq!(defs[1].outcome, PolymarketOutcome::from("Down"));
     }
 
     #[rstest]
@@ -318,10 +369,19 @@ mod tests {
         let defs = parse_gamma_market(&market).unwrap();
         let yes_def = &defs[0];
 
-        assert_eq!(yes_def.condition_id.as_str(), "0xabc123def456789");
-        assert_eq!(yes_def.market_id, "123456");
-        assert_eq!(yes_def.question_id.as_deref(), Some("0xquestion123"));
-        assert_eq!(yes_def.question, "Will BTC exceed $100k by end of 2025?");
+        assert_eq!(
+            yes_def.condition_id.as_str(),
+            "0x78443f961b9a65869dcb39359de9960165c7e5cbad0904eac7f29cd77872a63b"
+        );
+        assert_eq!(yes_def.market_id, "1557558");
+        assert_eq!(
+            yes_def.question_id.as_deref(),
+            Some("0x15813764bba41cfb5f99e2e649cfbae7a121a9f8f91ed47ca261aab95e9729de")
+        );
+        assert_eq!(
+            yes_def.question,
+            "Bitcoin Up or Down - March 12, 5:20AM-5:25AM ET"
+        );
         assert_eq!(yes_def.tick_size, dec!(0.01));
         assert_eq!(yes_def.price_precision, 2);
         assert_eq!(yes_def.min_size, Some(dec!(5.0)));
@@ -330,7 +390,7 @@ mod tests {
         assert!(yes_def.active);
         assert_eq!(
             yes_def.market_slug.as_deref(),
-            Some("will-btc-exceed-100k-by-end-of-2025")
+            Some("btc-updown-5m-1773307200")
         );
     }
 
@@ -341,11 +401,11 @@ mod tests {
 
         assert_eq!(
             defs[0].symbol.as_str(),
-            "0xabc123def456789-71321045679252212594626385532706912750332728571942532289631379312455583992563"
+            "0x78443f961b9a65869dcb39359de9960165c7e5cbad0904eac7f29cd77872a63b-104239898038807136052399800151408521467737075933964991162589336683346093173875"
         );
         assert_eq!(
             defs[1].symbol.as_str(),
-            "0xabc123def456789-52114319501245678901234567890123456789012345678901234567890123456789"
+            "0x78443f961b9a65869dcb39359de9960165c7e5cbad0904eac7f29cd77872a63b-71183960810705820955071415844881728181970340514894896943812046065452395013351"
         );
     }
 
@@ -356,11 +416,11 @@ mod tests {
 
         assert_eq!(
             defs[0].token_id.as_str(),
-            "71321045679252212594626385532706912750332728571942532289631379312455583992563"
+            "104239898038807136052399800151408521467737075933964991162589336683346093173875"
         );
         assert_eq!(
             defs[1].token_id.as_str(),
-            "52114319501245678901234567890123456789012345678901234567890123456789"
+            "71183960810705820955071415844881728181970340514894896943812046065452395013351"
         );
     }
 
@@ -425,9 +485,9 @@ mod tests {
 
         assert_eq!(
             binary.id.to_string(),
-            "0xabc123def456789-71321045679252212594626385532706912750332728571942532289631379312455583992563.POLYMARKET"
+            "0x78443f961b9a65869dcb39359de9960165c7e5cbad0904eac7f29cd77872a63b-104239898038807136052399800151408521467737075933964991162589336683346093173875.POLYMARKET"
         );
-        assert_eq!(binary.outcome, Some(Ustr::from("Yes")));
+        assert_eq!(binary.outcome, Some(Ustr::from("Up")));
         assert_eq!(binary.asset_class, AssetClass::Alternative);
         assert_eq!(binary.currency.code.as_str(), "USDC");
         assert_eq!(binary.price_precision, 2);
@@ -452,14 +512,20 @@ mod tests {
         let info = binary.info.as_ref().expect("info should be Some");
         assert_eq!(
             info.get_str("token_id"),
-            Some("71321045679252212594626385532706912750332728571942532289631379312455583992563")
+            Some("104239898038807136052399800151408521467737075933964991162589336683346093173875")
         );
-        assert_eq!(info.get_str("condition_id"), Some("0xabc123def456789"));
-        assert_eq!(info.get_str("market_id"), Some("123456"));
-        assert_eq!(info.get_str("question_id"), Some("0xquestion123"));
+        assert_eq!(
+            info.get_str("condition_id"),
+            Some("0x78443f961b9a65869dcb39359de9960165c7e5cbad0904eac7f29cd77872a63b")
+        );
+        assert_eq!(info.get_str("market_id"), Some("1557558"));
+        assert_eq!(
+            info.get_str("question_id"),
+            Some("0x15813764bba41cfb5f99e2e649cfbae7a121a9f8f91ed47ca261aab95e9729de")
+        );
         assert_eq!(
             info.get_str("market_slug"),
-            Some("will-btc-exceed-100k-by-end-of-2025")
+            Some("btc-updown-5m-1773307200")
         );
     }
 
@@ -489,5 +555,50 @@ mod tests {
 
         assert_eq!(binary.max_price, Some(Price::from("0.999")));
         assert_eq!(binary.min_price, Some(Price::from("0.001")));
+    }
+
+    #[rstest]
+    fn test_rebuild_instrument_with_tick_size() {
+        let market = load_gamma_market("gamma_market.json");
+        let defs = parse_gamma_market(&market).unwrap();
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        // Original has tick_size 0.01 → price_precision 2
+        let instrument = create_instrument_from_def(&defs[0], ts_init).unwrap();
+        assert_eq!(instrument.price_precision(), 2);
+
+        let ts_event = UnixNanos::from(2_000_000_000u64);
+        let rebuilt =
+            rebuild_instrument_with_tick_size(&instrument, "0.001", ts_event, ts_event).unwrap();
+
+        assert_eq!(rebuilt.price_precision(), 3);
+        assert_eq!(rebuilt.price_increment(), Price::from("0.001"));
+    }
+
+    #[rstest]
+    fn test_rebuild_instrument_preserves_fields() {
+        let market = load_gamma_market("gamma_market.json");
+        let defs = parse_gamma_market(&market).unwrap();
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let instrument = create_instrument_from_def(&defs[0], ts_init).unwrap();
+        let ts_event = UnixNanos::from(2_000_000_000u64);
+        let rebuilt =
+            rebuild_instrument_with_tick_size(&instrument, "0.01", ts_event, ts_event).unwrap();
+
+        assert_eq!(rebuilt.id(), instrument.id());
+        assert_eq!(rebuilt.raw_symbol(), instrument.raw_symbol());
+        assert_eq!(rebuilt.size_precision(), instrument.size_precision());
+
+        let orig_bo = match &instrument {
+            InstrumentAny::BinaryOption(b) => b,
+            _ => panic!(),
+        };
+        let new_bo = match &rebuilt {
+            InstrumentAny::BinaryOption(b) => b,
+            _ => panic!(),
+        };
+        assert_eq!(new_bo.outcome, orig_bo.outcome);
+        assert_eq!(new_bo.currency, orig_bo.currency);
     }
 }

@@ -494,17 +494,12 @@ class Position:
     def avg_px_open(self) -> Price: ...
     @property
     def event_count(self) -> int: ...
-    @property
     def venue_order_ids(self) -> list[VenueOrderId]: ...
-    @property
     def client_order_ids(self) -> list[ClientOrderId]: ...
-    @property
     def trade_ids(self) -> list[TradeId]: ...
     @property
     def last_trade_id(self) -> TradeId | None: ...
-    @property
     def events(self) -> list[OrderFilled]: ...
-    @property
     def adjustments(self) -> list[PositionAdjusted]: ...
     @property
     def is_open(self) -> bool: ...
@@ -1182,12 +1177,15 @@ class FundingRateUpdate:
         rate: Decimal,
         ts_event: int,
         ts_init: int,
+        interval: int | None = None,
         next_funding_ns: int | None = None,
     ) -> None: ...
     @property
     def instrument_id(self) -> InstrumentId: ...
     @property
     def rate(self) -> Decimal: ...
+    @property
+    def interval(self) -> int | None: ...
     @property
     def next_funding_ns(self) -> int | None: ...
     @property
@@ -4736,6 +4734,8 @@ class ParquetDataCatalogV2:
     def instruments(
         self,
         instrument_ids: list[str] | None = None,
+        start: int | None = None,
+        end: int | None = None,
     ) -> list[object]: ...
     def write_custom_data(
         self,
@@ -6848,6 +6848,10 @@ class BybitHttpClient:
         product_type: BybitProductType,
         symbol: str | None = None,
     ) -> list[Instrument]: ...
+    async def request_instrument_statuses(
+        self,
+        product_type: BybitProductType,
+    ) -> dict[InstrumentId, MarketStatusAction]: ...
     async def request_trades(
         self,
         product_type: BybitProductType,
@@ -8029,6 +8033,18 @@ class OKXHttpClient:
         end: dt.datetime | None = None,
         limit: int | None = None,
     ) -> list[Bar]: ...
+    async def request_orderbook_snapshot(
+        self,
+        instrument_id: InstrumentId,
+        depth: int | None = None,
+    ) -> OrderBookDeltas: ...
+    async def request_funding_rates(
+        self,
+        instrument_id: InstrumentId,
+        start: dt.datetime | None = None,
+        end: dt.datetime | None = None,
+        limit: int | None = None,
+    ) -> list[FundingRateUpdate]: ...
     async def request_mark_price(
         self,
         instrument_id: InstrumentId,
@@ -8078,6 +8094,24 @@ class OKXHttpClient:
         instrument_type: OKXInstrumentType | None = None,
         instrument_id: InstrumentId | None = None,
     ) -> list[PositionStatusReport]: ...
+    async def place_order(
+        self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        td_mode: OKXTradeMode,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        time_in_force: TimeInForce | None = None,
+        price: Price | None = None,
+        post_only: bool | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        position_side: PositionSide | None = None,
+        attach_algo_ords: list[dict[str, str]] | None = None,
+    ) -> Any: ...
     async def place_algo_order(
         self,
         trader_id: TraderId,
@@ -8092,6 +8126,7 @@ class OKXHttpClient:
         trigger_type: TriggerType | None = None,
         limit_price: Price | None = None,
         reduce_only: bool | None = None,
+        close_fraction: str | None = None,
         callback_ratio: str | None = None,
         callback_spread: str | None = None,
         activation_price: Price | None = None,
@@ -8141,6 +8176,7 @@ class OKXWebSocketClient:
         api_passphrase: str | None = None,
         account_id: AccountId | None = None,
         heartbeat: int | None = None,
+        auth_timeout_secs: int | None = None,
     ) -> None: ...
     @staticmethod
     def with_credentials(
@@ -8150,6 +8186,7 @@ class OKXWebSocketClient:
         api_passphrase: str | None = None,
         account_id: AccountId | None = None,
         heartbeat: int | None = None,
+        auth_timeout_secs: int | None = None,
     ) -> OKXWebSocketClient: ...
     @staticmethod
     def from_env() -> OKXWebSocketClient: ...
@@ -8229,6 +8266,7 @@ class OKXWebSocketClient:
         reduce_only: bool | None = None,
         quote_quantity: bool | None = None,
         position_side: PositionSide | None = None,
+        attach_algo_ords: list[dict[str, str]] | None = None,
     ) -> None: ...
     async def cancel_order(
         self,
@@ -8284,6 +8322,7 @@ def get_okx_http_base_url() -> str: ...
 def get_okx_ws_url_public(is_demo: bool) -> str: ...
 def get_okx_ws_url_private(is_demo: bool) -> str: ...
 def get_okx_ws_url_business(is_demo: bool) -> str: ...
+def derive_okx_ws_url(base_url: str, channel: str) -> str: ...
 def okx_requires_authentication(endpoint_type: OKXEndpointType) -> bool: ...
 
 class OKXInstrumentType(Enum):
@@ -8638,7 +8677,6 @@ HYPERLIQUID_POST_ONLY_WOULD_MATCH: Final[str]
 
 def hyperliquid_product_type_from_symbol(symbol: str) -> HyperliquidProductType: ...
 def hyperliquid_cloid_from_client_order_id(client_order_id: ClientOrderId) -> str: ...
-def revoke_hyperliquid_builder_fee(non_interactive: bool = False) -> bool: ...
 def get_hyperliquid_http_base_url(is_testnet: bool = False) -> str: ...
 def get_hyperliquid_ws_url(is_testnet: bool = False) -> str: ...
 
@@ -9020,6 +9058,23 @@ class KrakenFuturesHttpClient:
         reduce_only: bool = False,
         post_only: bool = False,
     ) -> OrderStatusReport: ...
+    async def submit_orders_batch(
+        self,
+        orders: list[
+            tuple[
+                InstrumentId,
+                ClientOrderId,
+                OrderSide,
+                OrderType,
+                Quantity,
+                TimeInForce,
+                Price | None,
+                Price | None,
+                bool,
+                bool,
+            ]
+        ],
+    ) -> list[str]: ...
     async def modify_order(
         self,
         instrument_id: InstrumentId,
@@ -9469,14 +9524,24 @@ class PortfolioAnalyzer:
     def __init__(self) -> None: ...
     def currencies(self) -> list[Currency]: ...
     def get_performance_stats_returns(self) -> dict[str, float]: ...
+    def get_performance_stats_position_returns(self) -> dict[str, float]: ...
+    def get_performance_stats_portfolio_returns(self) -> dict[str, float]: ...
     def get_performance_stats_pnls(
         self,
         currency: Currency | None = None,
         unrealized_pnl: Money | None = None,
     ) -> dict[str, float]: ...
     def get_performance_stats_general(self) -> dict[str, float]: ...
+    def add_position_return(self, timestamp: int, value: float) -> None: ...
     def add_return(self, timestamp: int, value: float) -> None: ...
     def reset(self) -> None: ...
+    def returns(self) -> dict[int, float]: ...
+    def position_returns(self) -> dict[int, float]: ...
+    def portfolio_returns(self) -> dict[int, float]: ...
+    def get_stats_returns_formatted(self) -> list[str]: ...
+    def get_stats_position_returns_formatted(self) -> list[str]: ...
+    def get_stats_portfolio_returns_formatted(self) -> list[str]: ...
+    def get_stats_general_formatted(self) -> list[str]: ...
 
 class SharpeRatio:
     def __init__(self, period: int = 252) -> None: ...
@@ -9613,154 +9678,3 @@ class BinanceEnvironment(Enum):
     MAINNET = "MAINNET"
     TESTNET = "TESTNET"
     DEMO = "DEMO"
-
-class BinanceSpotHttpClient:
-    def __init__(
-        self,
-        environment: BinanceEnvironment = ...,
-        api_key: str | None = None,
-        api_secret: str | None = None,
-        base_url: str | None = None,
-        recv_window: int | None = None,
-        timeout_secs: int | None = None,
-        proxy_url: str | None = None,
-    ) -> None: ...
-    @property
-    def schema_id(self) -> int: ...
-    @property
-    def schema_version(self) -> int: ...
-    async def ping(self) -> None: ...
-    async def server_time(self) -> int: ...
-    async def request_instruments(self) -> list[Instrument]: ...
-    async def request_trades(
-        self,
-        instrument_id: InstrumentId,
-        limit: int | None = None,
-    ) -> list[TradeTick]: ...
-    async def request_order_status(
-        self,
-        account_id: AccountId,
-        instrument_id: InstrumentId,
-        venue_order_id: VenueOrderId | None = None,
-        client_order_id: ClientOrderId | None = None,
-    ) -> OrderStatusReport: ...
-    async def request_order_status_reports(
-        self,
-        account_id: AccountId,
-        instrument_id: InstrumentId | None = None,
-        start: dt.datetime | None = None,
-        end: dt.datetime | None = None,
-        open_only: bool = False,
-        limit: int | None = None,
-    ) -> list[OrderStatusReport]: ...
-    async def request_fill_reports(
-        self,
-        account_id: AccountId,
-        instrument_id: InstrumentId,
-        venue_order_id: VenueOrderId | None = None,
-        start: dt.datetime | None = None,
-        end: dt.datetime | None = None,
-        limit: int | None = None,
-    ) -> list[FillReport]: ...
-    async def request_bars(
-        self,
-        bar_type: BarType,
-        start: dt.datetime | None = None,
-        end: dt.datetime | None = None,
-        limit: int | None = None,
-    ) -> list[Bar]: ...
-    async def submit_order(
-        self,
-        account_id: AccountId,
-        instrument_id: InstrumentId,
-        client_order_id: ClientOrderId,
-        order_side: OrderSide,
-        order_type: OrderType,
-        quantity: Quantity,
-        time_in_force: TimeInForce,
-        price: Price | None = None,
-        trigger_price: Price | None = None,
-        post_only: bool = False,
-    ) -> OrderStatusReport: ...
-    async def modify_order(
-        self,
-        account_id: AccountId,
-        instrument_id: InstrumentId,
-        venue_order_id: VenueOrderId,
-        client_order_id: ClientOrderId,
-        order_side: OrderSide,
-        order_type: OrderType,
-        quantity: Quantity,
-        time_in_force: TimeInForce,
-        price: Price | None = None,
-    ) -> OrderStatusReport: ...
-    async def cancel_order(
-        self,
-        instrument_id: InstrumentId,
-        venue_order_id: VenueOrderId | None = None,
-        client_order_id: ClientOrderId | None = None,
-    ) -> VenueOrderId: ...
-    async def cancel_all_orders(
-        self,
-        instrument_id: InstrumentId,
-    ) -> list[VenueOrderId]: ...
-
-class BinanceFuturesHttpClient:
-    def __init__(
-        self,
-        product_type: BinanceProductType,
-        environment: BinanceEnvironment = ...,
-        api_key: str | None = None,
-        api_secret: str | None = None,
-        base_url: str | None = None,
-        recv_window: int | None = None,
-        timeout_secs: int | None = None,
-        proxy_url: str | None = None,
-    ) -> None: ...
-    @property
-    def product_type(self) -> BinanceProductType: ...
-    async def server_time(self) -> int: ...
-    async def request_instruments(self) -> list[Instrument]: ...
-    async def create_listen_key(self) -> str: ...
-    async def keepalive_listen_key(self, listen_key: str) -> None: ...
-    async def close_listen_key(self, listen_key: str) -> None: ...
-    async def query_hedge_mode(self) -> bool: ...
-    async def query_account(self) -> dict[str, Any]: ...
-
-class BinanceSpotWebSocketClient:
-    def __init__(
-        self,
-        url: str | None = None,
-        api_key: str | None = None,
-        api_secret: str | None = None,
-        heartbeat: int | None = None,
-    ) -> None: ...
-    def is_active(self) -> bool: ...
-    def is_closed(self) -> bool: ...
-    def subscription_count(self) -> int: ...
-    def cache_instrument(self, instrument: Instrument) -> None: ...
-    async def connect(self, loop_: Any, callback: Callable) -> None: ...
-    async def close(self) -> None: ...
-    async def subscribe(self, streams: list[str]) -> None: ...
-    async def unsubscribe(self, streams: list[str]) -> None: ...
-
-class BinanceFuturesWebSocketClient:
-    def __init__(
-        self,
-        product_type: BinanceProductType,
-        environment: BinanceEnvironment,
-        api_key: str | None = None,
-        api_secret: str | None = None,
-        url_override: str | None = None,
-        heartbeat: int | None = None,
-    ) -> None: ...
-    @property
-    def product_type(self) -> BinanceProductType: ...
-    def is_active(self) -> bool: ...
-    def is_closed(self) -> bool: ...
-    def subscription_count(self) -> int: ...
-    def cache_instrument(self, instrument: Instrument) -> None: ...
-    async def connect(self, loop_: Any, callback: Callable) -> None: ...
-    async def close(self) -> None: ...
-    async def subscribe(self, streams: list[str]) -> None: ...
-    async def unsubscribe(self, streams: list[str]) -> None: ...

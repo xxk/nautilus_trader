@@ -122,6 +122,10 @@ pub enum DydxTimeInForce {
         from_py_object
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.dydx")
+)]
 pub enum DydxOrderSide {
     /// Buy order.
     Buy,
@@ -142,7 +146,7 @@ impl TryFrom<OrderSide> for DydxOrderSide {
 }
 
 impl DydxOrderSide {
-    /// Try to convert from Nautilus `OrderSide`.
+    /// Tries to convert from Nautilus `OrderSide`.
     ///
     /// # Errors
     ///
@@ -187,6 +191,10 @@ impl From<DydxOrderSide> for OrderSide {
         from_py_object
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.dydx")
+)]
 pub enum DydxOrderType {
     /// Limit order with specified price.
     Limit,
@@ -200,7 +208,7 @@ pub enum DydxOrderType {
     TakeProfitLimit,
     /// Take-profit order (market).
     TakeProfitMarket,
-    /// Trailing stop order.
+    /// Trailing stop order (parsing only, not supported for submission).
     TrailingStop,
 }
 
@@ -222,7 +230,7 @@ impl TryFrom<OrderType> for DydxOrderType {
 }
 
 impl DydxOrderType {
-    /// Try to convert from Nautilus `OrderType`.
+    /// Tries to convert from Nautilus `OrderType`.
     ///
     /// # Errors
     ///
@@ -579,7 +587,7 @@ pub enum DydxTradeType {
     TwapSuborder,
     /// Stop limit order.
     StopLimit,
-    /// Take profit limit order.
+    /// Take-profit order (limit).
     TakeProfitLimit,
 }
 
@@ -607,6 +615,10 @@ pub enum DydxTradeType {
         eq_int,
         from_py_object
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.dydx")
 )]
 pub enum DydxTransferType {
     /// Transfer into the account.
@@ -645,6 +657,10 @@ pub enum DydxTransferType {
         eq_int,
         from_py_object
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.dydx")
 )]
 pub enum DydxCandleResolution {
     /// 1 minute candles.
@@ -913,16 +929,20 @@ mod tests {
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.dydx", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.dydx")
+)]
 pub enum DydxNetwork {
-    /// dYdX mainnet (dydx-mainnet-1)
+    /// dYdX mainnet (dydx-mainnet-1).
     #[default]
     Mainnet,
-    /// dYdX testnet (dydx-testnet-4)
+    /// dYdX testnet (dydx-testnet-4).
     Testnet,
 }
 
 impl DydxNetwork {
-    /// Map the logical network to the underlying gRPC chain identifier.
+    /// Maps the logical network to the underlying gRPC chain identifier.
     #[must_use]
     pub const fn chain_id(self) -> ChainId {
         match self {
@@ -931,7 +951,7 @@ impl DydxNetwork {
         }
     }
 
-    /// Return the canonical lowercase string used in config/env.
+    /// Returns the canonical lowercase string used in config/env.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

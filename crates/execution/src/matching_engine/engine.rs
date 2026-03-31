@@ -13,10 +13,6 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-// Under development
-#![allow(dead_code)]
-#![allow(unused_variables)]
-
 use std::{
     cell::RefCell,
     cmp::min,
@@ -99,6 +95,7 @@ pub struct OrderMatchingEngine {
     book: OrderBook,
     fill_model: FillModelAny,
     fee_model: FeeModelAny,
+    event_handler: Option<Rc<dyn Fn(OrderEventAny)>>,
     target_bid: Option<Price>,
     target_ask: Option<Price>,
     target_last: Option<Price>,
@@ -121,6 +118,8 @@ pub struct OrderMatchingEngine {
     prev_bid_size_raw: QuantityRaw,
     prev_ask_price_raw: PriceRaw,
     prev_ask_size_raw: QuantityRaw,
+    last_quote_bid: Option<Price>,
+    last_quote_ask: Option<Price>,
     tob_initialized: bool,
     instrument_close: Option<InstrumentClose>,
     settlement_price: Option<Price>,
@@ -169,6 +168,7 @@ impl OrderMatchingEngine {
             raw_id,
             fill_model,
             fee_model,
+            event_handler: None,
             book_type,
             oms_type,
             account_type,
@@ -200,10 +200,31 @@ impl OrderMatchingEngine {
             prev_bid_size_raw: 0,
             prev_ask_price_raw: 0,
             prev_ask_size_raw: 0,
+            last_quote_bid: None,
+            last_quote_ask: None,
             tob_initialized: false,
             instrument_close: None,
             settlement_price: None,
             expiration_processed: false,
+        }
+    }
+
+    /// Sets the event handler for dispatching order events.
+    ///
+    /// When set, events are routed through the handler instead of directly
+    /// through the message bus. This allows sandbox execution clients to
+    /// dispatch events through the async runner channel, avoiding `RefCell`
+    /// re-entrancy panics.
+    pub fn set_event_handler(&mut self, handler: Rc<dyn Fn(OrderEventAny)>) {
+        self.event_handler = Some(handler);
+    }
+
+    fn dispatch_order_event(&self, event: OrderEventAny) {
+        if let Some(handler) = &self.event_handler {
+            handler(event);
+        } else {
+            let endpoint = MessagingSwitchboard::exec_engine_process();
+            msgbus::send_order_event(endpoint, event);
         }
     }
 
@@ -233,6 +254,8 @@ impl OrderMatchingEngine {
         self.prev_bid_size_raw = 0;
         self.prev_ask_price_raw = 0;
         self.prev_ask_size_raw = 0;
+        self.last_quote_bid = None;
+        self.last_quote_ask = None;
         self.tob_initialized = false;
         self.instrument_close = None;
         self.settlement_price = None;
@@ -1096,6 +1119,8 @@ impl OrderMatchingEngine {
                 depth.ts_init,
             );
             self.book.update_quote_tick(&quote)?;
+            self.last_quote_bid = Some(depth.bids[0].price);
+            self.last_quote_ask = Some(depth.asks[0].price);
         } else {
             self.book.apply_depth(depth)?;
         }
@@ -1175,6 +1200,8 @@ impl OrderMatchingEngine {
                 self.tob_initialized = true;
             }
             self.book.update_quote_tick(quote).unwrap();
+            self.last_quote_bid = Some(quote.bid_price);
+            self.last_quote_ask = Some(quote.ask_price);
         }
 
         self.iterate(quote.ts_init, AggressorSide::NoAggressor);
@@ -1419,6 +1446,8 @@ impl OrderMatchingEngine {
         quote_tick.bid_size = bid_close_size;
         quote_tick.ask_size = ask_close_size;
         self.book.update_quote_tick(&quote_tick).unwrap();
+        self.last_quote_bid = Some(bid_bar.close);
+        self.last_quote_ask = Some(ask_bar.close);
         self.iterate(quote_tick.ts_init, AggressorSide::NoAggressor);
 
         self.last_bar_bid = None;
@@ -1472,24 +1501,28 @@ impl OrderMatchingEngine {
 
         match aggressor_side {
             AggressorSide::Buyer => {
+                // Buyer lifted the ask: ask was at trade.price, post-trade
+                // ask is at least this level (only widen)
                 if self.core.ask.is_none() || price_raw > self.core.ask.map_or(0, |p| p.raw) {
                     self.core.set_ask_raw(trade.price);
                 }
 
-                if self.core.bid.is_none()
-                    || price_raw < self.core.bid.map_or(PriceRaw::MAX, |p| p.raw)
-                {
+                // Initialize bid from first trade if needed
+                if self.core.bid.is_none() {
                     self.core.set_bid_raw(trade.price);
                 }
             }
             AggressorSide::Seller => {
+                // Seller hit the bid: bid was at trade.price, post-trade
+                // bid is at most this level (only narrow)
                 if self.core.bid.is_none()
                     || price_raw < self.core.bid.map_or(PriceRaw::MAX, |p| p.raw)
                 {
                     self.core.set_bid_raw(trade.price);
                 }
 
-                if self.core.ask.is_none() || price_raw > self.core.ask.map_or(0, |p| p.raw) {
+                // Initialize ask from first trade if needed
+                if self.core.ask.is_none() {
                     self.core.set_ask_raw(trade.price);
                 }
             }
@@ -1542,23 +1575,43 @@ impl OrderMatchingEngine {
         self.last_trade_size = None;
         self.trade_consumption = 0;
 
-        // Restore original bid/ask after temporary trade price override
-        match aggressor_side {
-            AggressorSide::Seller => {
-                if let Some(ask) = original_ask
-                    && price_raw < ask.raw
-                {
-                    self.core.ask = Some(ask);
+        // Restore the non-aggressor side after temporary trade price override.
+        // For L2/L3 books the book has independent depth so restore from originals.
+        // For L1_MBP restore from the last quote values (not originals, which are
+        // polluted by iterate's L1 book sync). Without quotes, skip the restore
+        // so the core tracks the latest trade price.
+        if self.book_type == BookType::L1_MBP {
+            match aggressor_side {
+                AggressorSide::Seller => {
+                    if let Some(ask) = self.last_quote_ask {
+                        self.core.ask = Some(ask);
+                    }
                 }
-            }
-            AggressorSide::Buyer => {
-                if let Some(bid) = original_bid
-                    && price_raw > bid.raw
-                {
-                    self.core.bid = Some(bid);
+                AggressorSide::Buyer => {
+                    if let Some(bid) = self.last_quote_bid {
+                        self.core.bid = Some(bid);
+                    }
                 }
+                AggressorSide::NoAggressor => {}
             }
-            AggressorSide::NoAggressor => {}
+        } else {
+            match aggressor_side {
+                AggressorSide::Seller => {
+                    if let Some(ask) = original_ask
+                        && price_raw < ask.raw
+                    {
+                        self.core.ask = Some(ask);
+                    }
+                }
+                AggressorSide::Buyer => {
+                    if let Some(bid) = original_bid
+                        && price_raw > bid.raw
+                    {
+                        self.core.bid = Some(bid);
+                    }
+                }
+                AggressorSide::NoAggressor => {}
+            }
         }
     }
 
@@ -2011,7 +2064,7 @@ impl OrderMatchingEngine {
     }
 
     /// Processes a cancel all orders command for an instrument.
-    pub fn process_cancel_all(&mut self, command: &CancelAllOrders, account_id: AccountId) {
+    pub fn process_cancel_all(&mut self, command: &CancelAllOrders, _account_id: AccountId) {
         let instrument_id = command.instrument_id;
         let open_orders = self
             .cache
@@ -2505,6 +2558,11 @@ impl OrderMatchingEngine {
         // Process expiration before matching to prevent fills on expired instruments
         self.check_instrument_expiration();
 
+        // Expire GTD orders before matching to prevent fills on expired orders
+        if self.config.support_gtd_orders {
+            self.expire_gtd_orders(timestamp_ns);
+        }
+
         // Process bid actions before snapshotting asks so cross-side
         // contingencies (OCO/OUO) mutate state between sides
         for action in self.core.iterate_bids() {
@@ -2649,6 +2707,33 @@ impl OrderMatchingEngine {
                 hit
             }
             _ => true,
+        }
+    }
+
+    fn expire_gtd_orders(&mut self, timestamp_ns: UnixNanos) {
+        for match_info in self.core.get_orders() {
+            let order = match self
+                .cache
+                .borrow()
+                .order(&match_info.client_order_id)
+                .cloned()
+            {
+                Some(order) => order,
+                None => continue,
+            };
+
+            if order.is_closed() {
+                continue;
+            }
+
+            if order
+                .expire_time()
+                .is_some_and(|expire_ns| timestamp_ns >= expire_ns)
+            {
+                let _ = self.core.delete_order(match_info.client_order_id);
+                self.cached_filled_qty.remove(&match_info.client_order_id);
+                self.expire_order(&order);
+            }
         }
     }
 
@@ -3043,7 +3128,7 @@ impl OrderMatchingEngine {
         if let Some(filled_qty) = self.cached_filled_qty.get(&order.client_order_id())
             && filled_qty >= &order.quantity()
         {
-            log::info!(
+            log::debug!(
                 "Ignoring fill as already filled pending application of events: {:?}, {:?}, {:?}, {:?}",
                 filled_qty,
                 order.quantity(),
@@ -3163,7 +3248,7 @@ impl OrderMatchingEngine {
                     && qty >= order.quantity()
                 {
                     log::debug!(
-                        "Ignoring fill as already filled pending pending application of events: {}, {}, {}, {}",
+                        "Ignoring fill as already filled pending application of events: {}, {}, {}, {}",
                         qty,
                         order.quantity(),
                         order.filled_qty(),
@@ -3290,7 +3375,7 @@ impl OrderMatchingEngine {
     ) {
         if order.time_in_force() == TimeInForce::Fok {
             let mut total_size = Quantity::zero(order.quantity().precision);
-            for (fill_px, fill_qty) in fills {
+            for (_fill_px, fill_qty) in fills {
                 total_size = total_size.add(*fill_qty);
             }
 
@@ -3404,7 +3489,7 @@ impl OrderMatchingEngine {
             );
 
             if order.order_type() == OrderType::MarketToLimit && initial_market_to_limit_fill {
-                // filled initial level
+                // Filled initial level
                 return;
             }
         }
@@ -3439,7 +3524,7 @@ impl OrderMatchingEngine {
         last_qty: Quantity,
         liquidity_side: LiquiditySide,
         venue_position_id: Option<PositionId>,
-        position: Option<&Position>,
+        _position: Option<&Position>,
     ) {
         self.check_size_precision(last_qty.precision, "fill quantity")
             .unwrap();
@@ -3450,7 +3535,6 @@ impl OrderMatchingEngine {
                 let leaves_qty = order.quantity().saturating_sub(*filled_qty);
                 let last_qty = min(last_qty, leaves_qty);
                 let new_filled_qty = *filled_qty + last_qty;
-                // update cached filled qty
                 self.cached_filled_qty
                     .insert(order.client_order_id(), new_filled_qty);
             }
@@ -3460,7 +3544,6 @@ impl OrderMatchingEngine {
             }
         }
 
-        // calculate commission
         let commission = self
             .fee_model
             .get_commission(order, last_qty, last_px, &self.instrument)
@@ -3478,12 +3561,21 @@ impl OrderMatchingEngine {
             liquidity_side,
         );
 
-        if order.is_passive() && order.is_closed() {
-            // Check if order exists in OrderMatching core, and delete it if it does
+        let fully_filled = self
+            .cached_filled_qty
+            .get(&order.client_order_id())
+            .is_some_and(|qty| qty >= &order.quantity());
+
+        if order.is_passive() && (order.is_closed() || fully_filled) {
             if self.core.order_exists(order.client_order_id()) {
                 let _ = self.core.delete_order(order.client_order_id());
             }
-            self.cached_filled_qty.remove(&order.client_order_id());
+
+            // Only clear cached fills when the order status reflects closure,
+            // callers like process_market_to_limit_order still need the entry
+            if order.is_closed() {
+                self.cached_filled_qty.remove(&order.client_order_id());
+            }
         }
 
         if !self.config.support_contingent_orders {
@@ -4244,8 +4336,7 @@ impl OrderMatchingEngine {
             false,
             due_post_only,
         ));
-        let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, event);
+        self.dispatch_order_event(event);
     }
 
     fn generate_order_accepted(&self, order: &OrderAny, venue_order_id: VenueOrderId) {
@@ -4266,8 +4357,7 @@ impl OrderMatchingEngine {
             false,
         ));
 
-        let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, event);
+        self.dispatch_order_event(event);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4295,8 +4385,7 @@ impl OrderMatchingEngine {
             venue_order_id,
             account_id,
         ));
-        let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, event);
+        self.dispatch_order_event(event);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4324,8 +4413,7 @@ impl OrderMatchingEngine {
             venue_order_id,
             Some(account_id),
         ));
-        let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, event);
+        self.dispatch_order_event(event);
     }
 
     fn generate_order_updated(
@@ -4352,10 +4440,10 @@ impl OrderMatchingEngine {
             price,
             trigger_price,
             protection_price,
+            order.is_quote_quantity(),
         ));
 
-        let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, event);
+        self.dispatch_order_event(event);
     }
 
     fn generate_order_canceled(&self, order: &OrderAny, venue_order_id: VenueOrderId) {
@@ -4372,8 +4460,7 @@ impl OrderMatchingEngine {
             Some(venue_order_id),
             order.account_id(),
         ));
-        let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, event);
+        self.dispatch_order_event(event);
     }
 
     fn generate_order_triggered(&self, order: &OrderAny) {
@@ -4390,8 +4477,7 @@ impl OrderMatchingEngine {
             order.venue_order_id(),
             order.account_id(),
         ));
-        let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, event);
+        self.dispatch_order_event(event);
     }
 
     fn generate_order_expired(&self, order: &OrderAny) {
@@ -4408,8 +4494,7 @@ impl OrderMatchingEngine {
             order.venue_order_id(),
             order.account_id(),
         ));
-        let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, event);
+        self.dispatch_order_event(event);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4457,7 +4542,6 @@ impl OrderMatchingEngine {
             Some(commission),
         ));
 
-        let endpoint = MessagingSwitchboard::exec_engine_process();
-        msgbus::send_order_event(endpoint, event);
+        self.dispatch_order_event(event);
     }
 }

@@ -168,6 +168,10 @@ pub enum OKXOrderType {
         rename_all = "SCREAMING_SNAKE_CASE",
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
+)]
 pub enum OKXOrderStatus {
     Canceled,
     Live,
@@ -253,6 +257,10 @@ impl From<LiquiditySide> for OKXExecType {
         rename_all = "SCREAMING_SNAKE_CASE",
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
+)]
 pub enum OKXInstrumentType {
     #[default]
     Any,
@@ -317,6 +325,10 @@ pub enum OKXInstrumentStatus {
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXContractType {
     #[serde(rename = "")]
@@ -387,6 +399,10 @@ impl From<OKXOptionType> for OptionKind {
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXTradeMode {
     #[default]
@@ -460,6 +476,10 @@ pub enum OKXAccountMode {
         rename_all = "SCREAMING_SNAKE_CASE",
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
+)]
 pub enum OKXMarginMode {
     #[serde(rename = "")]
     #[default]
@@ -498,6 +518,10 @@ pub enum OKXMarginMode {
         rename_all = "SCREAMING_SNAKE_CASE",
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
+)]
 pub enum OKXPositionMode {
     #[default]
     #[serde(rename = "net_mode")]
@@ -533,6 +557,7 @@ pub enum OKXPositionSide {
     Copy,
     Clone,
     Debug,
+    Default,
     Display,
     PartialEq,
     Eq,
@@ -545,6 +570,7 @@ pub enum OKXPositionSide {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum OKXSelfTradePreventionMode {
+    #[default]
     #[serde(rename = "")]
     None,
     CancelMaker,
@@ -590,6 +616,7 @@ pub enum OKXTakeProfitKind {
     Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum OKXTriggerType {
     #[default]
     #[serde(rename = "")]
@@ -607,6 +634,31 @@ impl From<TriggerType> for OKXTriggerType {
             TriggerType::IndexPrice => Self::Index,
             _ => Self::Last,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use rstest::rstest;
+
+    use super::OKXTriggerType;
+
+    #[rstest]
+    fn test_okx_trigger_type_from_str_accepts_snake_case_values() {
+        assert_eq!(
+            OKXTriggerType::from_str("last").unwrap(),
+            OKXTriggerType::Last
+        );
+        assert_eq!(
+            OKXTriggerType::from_str("mark").unwrap(),
+            OKXTriggerType::Mark
+        );
+        assert_eq!(
+            OKXTriggerType::from_str("index").unwrap(),
+            OKXTriggerType::Index
+        );
     }
 }
 
@@ -681,6 +733,10 @@ pub enum OKXBookChannel {
         from_py_object,
         rename_all = "SCREAMING_SNAKE_CASE",
     )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXVipLevel {
     /// VIP level 0 (default tier).
@@ -1098,4 +1154,92 @@ pub enum OKXBarSize {
     Month1,
     #[serde(rename = "3M")]
     Month3,
+}
+
+/// Options price type for order pricing.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OKXPriceType {
+    /// No price type specified.
+    #[default]
+    #[serde(rename = "")]
+    None,
+    /// Standard price.
+    Px,
+    /// Price in USD.
+    Usd,
+    /// Price in implied volatility.
+    Vol,
+}
+
+/// Funding rate settlement state.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OKXSettlementState {
+    /// No settlement state.
+    #[default]
+    #[serde(rename = "")]
+    None,
+    /// Settlement in progress.
+    Processing,
+    /// Settlement completed.
+    Settled,
+}
+
+/// Quick margin type for order margin management.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OKXQuickMarginType {
+    /// No quick margin type.
+    #[default]
+    #[serde(rename = "")]
+    None,
+    /// Manual margin management.
+    Manual,
+    /// Auto borrow margin.
+    AutoBorrow,
+    /// Auto repay margin.
+    AutoRepay,
 }

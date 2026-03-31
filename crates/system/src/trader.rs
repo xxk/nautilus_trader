@@ -31,9 +31,10 @@ use nautilus_common::{
         stop_component,
     },
     enums::{ComponentState, ComponentTrigger, Environment},
+    messages::execution::TradingCommand,
     msgbus,
     msgbus::{
-        TypedHandler,
+        ShareableMessageHandler, TypedHandler,
         switchboard::{get_event_orders_topic, get_event_positions_topic},
     },
     timer::{TimeEvent, TimeEventCallback},
@@ -44,7 +45,7 @@ use nautilus_model::{
     identifiers::{ActorId, ComponentId, ExecAlgorithmId, StrategyId, TraderId},
 };
 use nautilus_portfolio::portfolio::Portfolio;
-use nautilus_trading::strategy::Strategy;
+use nautilus_trading::{ExecutionAlgorithm, strategy::Strategy};
 use ustr::Ustr;
 
 /// Central orchestrator for managing trading components.
@@ -227,22 +228,28 @@ impl Trader {
 
     /// Creates a clock for a component and registers it for time advancement.
     ///
-    /// Creates a test clock in backtest environment, otherwise returns a reference
-    /// to the system clock. The clock is stored in the per-component clock map so
-    /// the backtest engine can advance all component clocks together.
+    /// Each component gets its own clock instance so that the default time event
+    /// callback registered on each clock is independent. In backtest mode, the
+    /// clocks are also used for deterministic time advancement by the engine.
     pub fn create_component_clock(&mut self, component_id: ComponentId) -> Rc<RefCell<dyn Clock>> {
-        let clock = match self.environment {
-            Environment::Backtest => {
-                // Create individual test clock for component in backtest
-                Rc::new(RefCell::new(TestClock::new()))
-            }
-            Environment::Live | Environment::Sandbox => {
-                // Share system clock in live environments
-                self.clock.clone()
-            }
+        let clock: Rc<RefCell<dyn Clock>> = match self.environment {
+            Environment::Backtest => Rc::new(RefCell::new(TestClock::new())),
+            Environment::Live | Environment::Sandbox => Self::create_live_clock(),
         };
         self.clocks.insert(component_id, clock.clone());
         clock
+    }
+
+    #[cfg(feature = "live")]
+    fn create_live_clock() -> Rc<RefCell<dyn Clock>> {
+        Rc::new(RefCell::new(
+            nautilus_common::live::clock::LiveClock::default(), // nautilus-import-ok
+        ))
+    }
+
+    #[cfg(not(feature = "live"))]
+    fn create_live_clock() -> Rc<RefCell<dyn Clock>> {
+        panic!("Live/Sandbox environment requires the 'live' feature to be enabled");
     }
 
     /// Adds an actor to the trader.
@@ -337,6 +344,33 @@ impl Trader {
 
         log::debug!(
             "Added actor ID '{actor_id}' to trader {} for lifecycle management",
+            self.trader_id
+        );
+
+        Ok(())
+    }
+
+    /// Adds an externally-registered execution algorithm ID to the trader for lifecycle management.
+    ///
+    /// The execution algorithm must already be registered in the global component and actor
+    /// registries. This method only tracks the ID so the trader can manage the algorithm's
+    /// lifecycle (start/stop/dispose).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an execution algorithm with the same ID is already tracked.
+    pub fn add_exec_algorithm_id_for_lifecycle(
+        &mut self,
+        exec_algorithm_id: ExecAlgorithmId,
+    ) -> anyhow::Result<()> {
+        if self.exec_algorithm_ids.contains(&exec_algorithm_id) {
+            anyhow::bail!("Execution algorithm '{exec_algorithm_id}' is already tracked by trader");
+        }
+
+        self.exec_algorithm_ids.push(exec_algorithm_id);
+
+        log::debug!(
+            "Added exec algorithm ID '{exec_algorithm_id}' to trader {} for lifecycle management",
             self.trader_id
         );
 
@@ -525,14 +559,13 @@ impl Trader {
     /// - An execution algorithm with the same ID is already registered.
     pub fn add_exec_algorithm<T>(&mut self, mut exec_algorithm: T) -> anyhow::Result<()>
     where
-        T: DataActor + Component + Debug + 'static,
+        T: ExecutionAlgorithm + Component + Debug + 'static,
     {
         self.validate_component_registration()?;
 
         let exec_algorithm_id =
             ExecAlgorithmId::from(exec_algorithm.component_id().inner().as_str());
 
-        // Check for duplicate registration
         if self.exec_algorithm_ids.contains(&exec_algorithm_id) {
             anyhow::bail!("Execution algorithm '{exec_algorithm_id}' is already registered");
         }
@@ -542,8 +575,22 @@ impl Trader {
 
         exec_algorithm.register(self.trader_id, clock, self.cache.clone())?;
 
-        // Register in both component and actor registries
         register_component_actor(exec_algorithm);
+
+        // Register the {id}.execute endpoint so the order manager can
+        // route TradingCommands to this algorithm via msgbus::send_any
+        let actor_id = Ustr::from(exec_algorithm_id.inner().as_str());
+        let endpoint: Ustr = format!("{exec_algorithm_id}.execute").into();
+        let handler = ShareableMessageHandler::from_typed(move |command: &TradingCommand| {
+            if let Some(mut algo) = try_get_actor_unchecked::<T>(&actor_id) {
+                if let Err(e) = algo.execute(command.clone()) {
+                    log::error!("Error executing command on algorithm {actor_id}: {e}");
+                }
+            } else {
+                log::error!("Execution algorithm {actor_id} not found in registry");
+            }
+        });
+        msgbus::register_any(endpoint.into(), handler);
 
         self.exec_algorithm_ids.push(exec_algorithm_id);
 
@@ -669,6 +716,8 @@ impl Trader {
         for exec_algorithm_id in &self.exec_algorithm_ids {
             log::debug!("Disposing execution algorithm {exec_algorithm_id}");
             dispose_component(&exec_algorithm_id.inner())?;
+            let endpoint: Ustr = format!("{exec_algorithm_id}.execute").into();
+            msgbus::deregister_any(endpoint.into());
         }
 
         self.actor_ids.clear();
@@ -716,6 +765,8 @@ impl Trader {
         for exec_algorithm_id in &self.exec_algorithm_ids {
             log::debug!("Disposing execution algorithm {exec_algorithm_id}");
             dispose_component(&exec_algorithm_id.inner())?;
+            let endpoint: Ustr = format!("{exec_algorithm_id}.execute").into();
+            msgbus::deregister_any(endpoint.into());
             let component_id = ComponentId::new(exec_algorithm_id.inner().as_str());
             self.clocks.remove(&component_id);
         }
@@ -839,12 +890,15 @@ mod tests {
     use nautilus_model::{
         events::OrderAccepted,
         identifiers::{ActorId, ComponentId, TraderId},
+        orders::OrderAny,
         stubs::TestDefault,
     };
     use nautilus_portfolio::portfolio::Portfolio;
     use nautilus_risk::engine::{RiskEngine, config::RiskEngineConfig};
-    use nautilus_trading::strategy::{
-        Strategy as StrategyTrait, config::StrategyConfig, core::StrategyCore,
+    use nautilus_trading::{
+        ExecutionAlgorithm as ExecutionAlgorithmTrait, ExecutionAlgorithmConfig,
+        ExecutionAlgorithmCore,
+        strategy::{Strategy as StrategyTrait, config::StrategyConfig, core::StrategyCore},
     };
     use rstest::rstest;
 
@@ -876,6 +930,45 @@ mod tests {
     impl DerefMut for TestDataActor {
         fn deref_mut(&mut self) -> &mut Self::Target {
             &mut self.core
+        }
+    }
+
+    // Simple ExecutionAlgorithm wrapper for testing
+    #[derive(Debug)]
+    struct TestExecAlgorithm {
+        core: ExecutionAlgorithmCore,
+    }
+
+    impl TestExecAlgorithm {
+        fn new(config: ExecutionAlgorithmConfig) -> Self {
+            Self {
+                core: ExecutionAlgorithmCore::new(config),
+            }
+        }
+    }
+
+    impl DataActor for TestExecAlgorithm {}
+
+    impl Deref for TestExecAlgorithm {
+        type Target = DataActorCore;
+        fn deref(&self) -> &Self::Target {
+            &self.core
+        }
+    }
+
+    impl DerefMut for TestExecAlgorithm {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.core
+        }
+    }
+
+    impl ExecutionAlgorithmTrait for TestExecAlgorithm {
+        fn core_mut(&mut self) -> &mut ExecutionAlgorithmCore {
+            &mut self.core
+        }
+
+        fn on_order(&mut self, _order: OrderAny) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 
@@ -1147,11 +1240,11 @@ mod tests {
             portfolio,
         );
 
-        let config = DataActorConfig {
-            actor_id: Some(ActorId::from("TestExecAlgorithm")),
+        let config = ExecutionAlgorithmConfig {
+            exec_algorithm_id: Some(ExecAlgorithmId::from("TestExecAlgorithm")),
             ..Default::default()
         };
-        let exec_algorithm = TestDataActor::new(config);
+        let exec_algorithm = TestExecAlgorithm::new(config);
         let exec_algorithm_id = ExecAlgorithmId::from(exec_algorithm.actor_id().inner().as_str());
 
         let result = trader.add_exec_algorithm(exec_algorithm);
@@ -1186,11 +1279,11 @@ mod tests {
         };
         let strategy = TestStrategy::new(strategy_config);
 
-        let exec_algorithm_config = DataActorConfig {
-            actor_id: Some(ActorId::from("TestExecAlgorithm")),
+        let exec_algorithm_config = ExecutionAlgorithmConfig {
+            exec_algorithm_id: Some(ExecAlgorithmId::from("TestExecAlgorithm")),
             ..Default::default()
         };
-        let exec_algorithm = TestDataActor::new(exec_algorithm_config);
+        let exec_algorithm = TestExecAlgorithm::new(exec_algorithm_config);
 
         assert!(trader.add_actor(actor).is_ok());
         assert!(trader.add_strategy(strategy).is_ok());
@@ -1295,43 +1388,29 @@ mod tests {
     }
 
     #[rstest]
-    fn test_create_component_clock_backtest_vs_live() {
+    fn test_create_component_clock_backtest_creates_individual_clocks() {
         let (_msgbus, cache, portfolio, _data_engine, _risk_engine, _exec_engine, clock) =
             create_trader_components();
         let trader_id = TraderId::test_default();
         let instance_id = UUID4::new();
 
-        // Test backtest environment - should create individual test clocks
-        let mut trader_backtest = Trader::new(
+        let mut trader = Trader::new(
             trader_id,
             instance_id,
             Environment::Backtest,
-            clock.clone(),
-            cache.clone(),
-            portfolio.clone(),
-        );
-
-        let test_component = ComponentId::new("TEST-001");
-        let backtest_clock = trader_backtest.create_component_clock(test_component);
-        // In backtest, component clock should be different from system clock
-        assert_ne!(
-            backtest_clock.as_ptr() as *const _,
-            clock.as_ptr() as *const _
-        );
-
-        // Test live environment - should share system clock
-        let mut trader_live = Trader::new(
-            trader_id,
-            instance_id,
-            Environment::Live,
             clock.clone(),
             cache,
             portfolio,
         );
 
-        let live_clock = trader_live.create_component_clock(test_component);
-        // In live, component clock should be same as system clock
-        assert_eq!(live_clock.as_ptr() as *const _, clock.as_ptr() as *const _);
+        let component_a = ComponentId::new("ACTOR-A");
+        let component_b = ComponentId::new("ACTOR-B");
+        let clock_a = trader.create_component_clock(component_a);
+        let clock_b = trader.create_component_clock(component_b);
+
+        // Each component gets its own clock instance
+        assert_ne!(clock_a.as_ptr() as *const _, clock.as_ptr() as *const _);
+        assert_ne!(clock_a.as_ptr() as *const _, clock_b.as_ptr() as *const _);
     }
 
     #[rstest]

@@ -26,19 +26,18 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use nautilus_core::{
-    AtomicTime, UUID4, consts::NAUTILUS_USER_AGENT, nanos::UnixNanos,
+    AtomicMap, AtomicTime, UUID4, consts::NAUTILUS_USER_AGENT, nanos::UnixNanos,
     time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     data::{Bar, BarType, TradeTick},
     enums::{AccountType, CurrencyType, OrderSide, OrderType, TimeInForce},
     events::AccountState,
-    identifiers::{AccountId, ClientOrderId, InstrumentId, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_network::{
     http::{HttpClient, Method, USER_AGENT},
@@ -52,7 +51,7 @@ use ustr::Ustr;
 use super::{models::*, query::*};
 use crate::{
     common::{
-        consts::NAUTILUS_KRAKEN_BROKER_ID,
+        consts::{KRAKEN_VENUE, NAUTILUS_KRAKEN_BROKER_ID},
         credential::KrakenCredential,
         enums::{
             KrakenApiResult, KrakenEnvironment, KrakenFuturesOrderType, KrakenOrderSide,
@@ -76,6 +75,9 @@ const KRAKEN_GLOBAL_RATE_KEY: &str = "kraken:futures:global";
 
 /// Maximum orders per batch cancel request for Kraken Futures API.
 const BATCH_CANCEL_LIMIT: usize = 50;
+
+/// Maximum operations per batch order request for Kraken Futures API.
+const BATCH_ORDER_LIMIT: usize = 10;
 
 /// Raw HTTP client for low-level Kraken Futures API operations.
 ///
@@ -876,6 +878,46 @@ impl KrakenFuturesRawHttpClient {
         self.send_authenticated_post(endpoint, post_data).await
     }
 
+    /// Submits multiple orders in a single batch request (requires authentication).
+    pub async fn submit_orders_batch(
+        &self,
+        items: Vec<KrakenFuturesBatchSendItem>,
+    ) -> anyhow::Result<FuturesBatchOrderResponse, KrakenHttpError> {
+        if self.credential.is_none() {
+            return Err(KrakenHttpError::AuthenticationError(
+                "API credentials required for batch orders".to_string(),
+            ));
+        }
+
+        let params = KrakenFuturesBatchOrderParams::new(items);
+        let post_data = params
+            .to_body()
+            .map_err(|e| KrakenHttpError::ParseError(format!("Failed to serialize batch: {e}")))?;
+
+        let endpoint = "/derivatives/api/v3/batchorder";
+        self.send_authenticated_post(endpoint, post_data).await
+    }
+
+    /// Edits multiple orders in a single batch request (requires authentication).
+    pub async fn edit_orders_batch(
+        &self,
+        items: Vec<KrakenFuturesBatchEditItem>,
+    ) -> anyhow::Result<FuturesBatchOrderResponse, KrakenHttpError> {
+        if self.credential.is_none() {
+            return Err(KrakenHttpError::AuthenticationError(
+                "API credentials required for batch orders".to_string(),
+            ));
+        }
+
+        let params = KrakenFuturesBatchOrderParams::new(items);
+        let post_data = params
+            .to_body()
+            .map_err(|e| KrakenHttpError::ParseError(format!("Failed to serialize batch: {e}")))?;
+
+        let endpoint = "/derivatives/api/v3/batchorder";
+        self.send_authenticated_post(endpoint, post_data).await
+    }
+
     /// Cancels all open orders, optionally filtered by symbol (requires authentication).
     pub async fn cancel_all_orders(
         &self,
@@ -907,9 +949,13 @@ impl KrakenFuturesRawHttpClient {
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.kraken", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.kraken")
+)]
 pub struct KrakenFuturesHttpClient {
     pub(crate) inner: Arc<KrakenFuturesRawHttpClient>,
-    pub(crate) instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
+    pub(crate) instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
     clock: &'static AtomicTime,
     cache_initialized: Arc<AtomicBool>,
 }
@@ -973,7 +1019,7 @@ impl KrakenFuturesHttpClient {
                 proxy_url,
                 max_requests_per_second,
             )?),
-            instruments_cache: Arc::new(DashMap::new()),
+            instruments_cache: Arc::new(AtomicMap::new()),
             cache_initialized: Arc::new(AtomicBool::new(false)),
             clock: get_atomic_clock_realtime(),
         })
@@ -1006,7 +1052,7 @@ impl KrakenFuturesHttpClient {
                 proxy_url,
                 max_requests_per_second,
             )?),
-            instruments_cache: Arc::new(DashMap::new()),
+            instruments_cache: Arc::new(AtomicMap::new()),
             cache_initialized: Arc::new(AtomicBool::new(false)),
             clock: get_atomic_clock_realtime(),
         })
@@ -1077,26 +1123,26 @@ impl KrakenFuturesHttpClient {
     }
 
     /// Caches multiple instruments for symbol lookup.
-    pub fn cache_instruments(&self, instruments: Vec<InstrumentAny>) {
-        for instrument in instruments {
-            self.instruments_cache
-                .insert(instrument.symbol().inner(), instrument);
-        }
+    pub fn cache_instruments(&self, instruments: &[InstrumentAny]) {
+        self.instruments_cache.rcu(|m| {
+            for instrument in instruments {
+                m.insert(instrument.symbol().inner(), instrument.clone());
+            }
+        });
         self.cache_initialized.store(true, Ordering::Release);
     }
 
     /// Gets an instrument from the cache by symbol.
     pub fn get_cached_instrument(&self, symbol: &Ustr) -> Option<InstrumentAny> {
-        self.instruments_cache
-            .get(symbol)
-            .map(|entry| entry.value().clone())
+        self.instruments_cache.get_cloned(symbol)
     }
 
     fn get_instrument_by_raw_symbol(&self, raw_symbol: &str) -> Option<InstrumentAny> {
         self.instruments_cache
-            .iter()
-            .find(|entry| entry.value().raw_symbol().as_str() == raw_symbol)
-            .map(|entry| entry.value().clone())
+            .load()
+            .values()
+            .find(|inst| inst.raw_symbol().as_str() == raw_symbol)
+            .cloned()
     }
 
     fn generate_ts_init(&self) -> UnixNanos {
@@ -1334,114 +1380,23 @@ impl KrakenFuturesHttpClient {
         let ts_init = self.generate_ts_init();
 
         let mut balances: Vec<AccountBalance> = Vec::new();
+        let mut margins: Vec<MarginBalance> = Vec::new();
 
         for account in accounts_response.accounts.values() {
-            match account.account_type.as_str() {
-                "multiCollateralMarginAccount" => {
-                    for (currency_code, currency_info) in &account.currencies {
-                        if currency_info.quantity == 0.0 {
-                            continue;
-                        }
-
-                        let currency = Currency::new(
-                            currency_code.as_str(),
-                            8,
-                            0,
-                            currency_code.as_str(),
-                            CurrencyType::Crypto,
-                        );
-
-                        let total_amount = currency_info.quantity;
-                        let total = Money::new(total_amount, currency);
-
-                        // Available can exceed quantity with positive PnL, cap to satisfy invariant
-                        let available_amount = currency_info
-                            .available
-                            .unwrap_or(total_amount)
-                            .min(total_amount);
-                        let locked_amount = (total_amount - available_amount).max(0.0);
-                        let locked = Money::new(locked_amount, currency);
-                        // Compute free from total - locked to guarantee the invariant holds
-                        let free = total - locked;
-
-                        balances.push(AccountBalance::new(total, locked, free));
-                    }
-
-                    // Add USD balance from portfolio value for margin calculations.
-                    // Multi-collateral accounts track margin in USD even though the
-                    // actual collateral is held in various crypto currencies.
-                    if let Some(portfolio_value) = account.portfolio_value
-                        && portfolio_value > 0.0
-                    {
-                        let usd_currency = Currency::USD();
-                        let total_usd = Money::new(portfolio_value, usd_currency);
-                        let available_usd = account
-                            .available_margin
-                            .unwrap_or(portfolio_value)
-                            .min(portfolio_value);
-                        // Compute locked = total - available to guarantee the invariant holds
-                        let locked_usd =
-                            Money::new((portfolio_value - available_usd).max(0.0), usd_currency);
-                        let free_usd = total_usd - locked_usd;
-
-                        balances.push(AccountBalance::new(total_usd, locked_usd, free_usd));
-                    }
+            match account.account_type {
+                KrakenFuturesAccountType::MultiCollateralMarginAccount => {
+                    parse_multi_collateral_balances(account, &mut balances);
+                    parse_multi_collateral_margins(account, &mut margins);
                 }
-                "marginAccount" => {
-                    for (currency_code, &amount) in &account.balances {
-                        if amount == 0.0 {
-                            continue;
-                        }
-
-                        let currency = Currency::new(
-                            currency_code.as_str(),
-                            8,
-                            0,
-                            currency_code.as_str(),
-                            CurrencyType::Crypto,
-                        );
-
-                        let total = Money::new(amount, currency);
-
-                        // Available can exceed balance with positive PnL, cap to satisfy invariant
-                        let available = account
-                            .auxiliary
-                            .as_ref()
-                            .and_then(|aux| aux.af)
-                            .unwrap_or(amount)
-                            .min(amount);
-                        let locked = amount - available;
-
-                        balances.push(AccountBalance::new(
-                            total,
-                            Money::new(locked, currency),
-                            Money::new(available, currency),
-                        ));
-                    }
+                KrakenFuturesAccountType::MarginAccount => {
+                    parse_margin_account_balances(account, &mut balances);
+                    parse_margin_account_margins(account, &mut margins);
                 }
-                "cashAccount" => {
-                    for (currency_code, &amount) in &account.balances {
-                        if amount == 0.0 {
-                            continue;
-                        }
-
-                        let currency = Currency::new(
-                            currency_code.as_str(),
-                            8,
-                            0,
-                            currency_code.as_str(),
-                            CurrencyType::Crypto,
-                        );
-
-                        let total = Money::new(amount, currency);
-                        let locked = Money::new(0.0, currency);
-
-                        balances.push(AccountBalance::new(total, locked, total));
-                    }
+                KrakenFuturesAccountType::CashAccount => {
+                    parse_cash_account_balances(account, &mut balances);
                 }
-                _ => {
-                    let account_type = &account.account_type;
-                    log::debug!("Unknown account type: {account_type}");
+                KrakenFuturesAccountType::Unknown => {
+                    log::debug!("Unknown account type: {:?}", account.account_type);
                 }
             }
         }
@@ -1450,7 +1405,7 @@ impl KrakenFuturesHttpClient {
             account_id,
             AccountType::Margin,
             balances,
-            vec![],
+            margins,
             true,
             UUID4::new(),
             ts_init,
@@ -1654,20 +1609,9 @@ impl KrakenFuturesHttpClient {
         Ok(all_reports)
     }
 
-    /// Submits a new order to the Kraken Futures exchange.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Credentials are missing.
-    /// - The instrument is not found in cache.
-    /// - The order type or time in force is not supported.
-    /// - The request fails.
-    /// - The order is rejected.
     #[allow(clippy::too_many_arguments)]
-    pub async fn submit_order(
+    fn build_send_order_params(
         &self,
-        account_id: AccountId,
         instrument_id: InstrumentId,
         client_order_id: ClientOrderId,
         order_side: OrderSide,
@@ -1678,7 +1622,7 @@ impl KrakenFuturesHttpClient {
         trigger_price: Option<Price>,
         reduce_only: bool,
         post_only: bool,
-    ) -> anyhow::Result<OrderStatusReport> {
+    ) -> anyhow::Result<KrakenFuturesSendOrderParams> {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
@@ -1710,7 +1654,9 @@ impl KrakenFuturesHttpClient {
                 }
             }
             OrderType::StopMarket | OrderType::StopLimit => KrakenFuturesOrderType::Stop,
-            OrderType::MarketIfTouched => KrakenFuturesOrderType::TakeProfit,
+            OrderType::MarketIfTouched | OrderType::LimitIfTouched => {
+                KrakenFuturesOrderType::TakeProfit
+            }
             _ => anyhow::bail!("Unsupported order type: {order_type:?}"),
         };
 
@@ -1727,16 +1673,13 @@ impl KrakenFuturesHttpClient {
             .size(quantity.to_string())
             .order_type(kraken_order_type);
 
-        // Handle prices based on order type
         match order_type {
             OrderType::StopMarket => {
-                // Stop market orders need stop_price (trigger price)
                 if let Some(trigger) = trigger_price {
                     builder.stop_price(trigger.to_string());
                 }
             }
             OrderType::StopLimit => {
-                // Stop limit orders need both stop_price and limit_price
                 if let Some(trigger) = trigger_price {
                     builder.stop_price(trigger.to_string());
                 }
@@ -1745,8 +1688,7 @@ impl KrakenFuturesHttpClient {
                     builder.limit_price(limit.to_string());
                 }
             }
-            OrderType::MarketIfTouched => {
-                // Take-profit orders need stop_price (trigger price) and optionally limit_price
+            OrderType::MarketIfTouched | OrderType::LimitIfTouched => {
                 if let Some(trigger) = trigger_price {
                     builder.stop_price(trigger.to_string());
                 }
@@ -1756,7 +1698,6 @@ impl KrakenFuturesHttpClient {
                 }
             }
             _ => {
-                // Regular orders just use limit_price
                 if let Some(limit) = price {
                     builder.limit_price(limit.to_string());
                 }
@@ -1767,9 +1708,52 @@ impl KrakenFuturesHttpClient {
             builder.reduce_only(true);
         }
 
-        let params = builder
+        builder
             .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build order params: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to build order params: {e}"))
+    }
+
+    /// Submits a new order to the Kraken Futures exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The instrument is not found in cache.
+    /// - The order type or time in force is not supported.
+    /// - The request fails.
+    /// - The order is rejected.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_order(
+        &self,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        time_in_force: TimeInForce,
+        price: Option<Price>,
+        trigger_price: Option<Price>,
+        reduce_only: bool,
+        post_only: bool,
+    ) -> anyhow::Result<OrderStatusReport> {
+        let instrument = self
+            .get_cached_instrument(&instrument_id.symbol.inner())
+            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+
+        let params = self.build_send_order_params(
+            instrument_id,
+            client_order_id,
+            order_side,
+            order_type,
+            quantity,
+            time_in_force,
+            price,
+            trigger_price,
+            reduce_only,
+            post_only,
+        )?;
 
         let response = self.inner.send_order_params(&params).await?;
 
@@ -2048,10 +2032,283 @@ impl KrakenFuturesHttpClient {
 
         Ok(total_cancelled)
     }
+
+    /// Submits multiple orders in a single batch request.
+    ///
+    /// Builds batch send items from order parameters, chunks at the batch limit,
+    /// and returns per-item send statuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch request fails at the API level.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub async fn submit_orders_batch(
+        &self,
+        orders: Vec<(
+            InstrumentId,
+            ClientOrderId,
+            OrderSide,
+            OrderType,
+            Quantity,
+            TimeInForce,
+            Option<Price>,
+            Option<Price>,
+            bool,
+            bool,
+        )>,
+    ) -> anyhow::Result<Vec<FuturesSendStatus>> {
+        let count = orders.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Build params per-item, collecting validation errors individually
+        // so one invalid order does not block the valid ones
+        let mut all_statuses: Vec<Option<FuturesSendStatus>> = vec![None; count];
+        let mut valid_items = Vec::with_capacity(count);
+        let mut valid_indices = Vec::with_capacity(count);
+
+        for (
+            idx,
+            (
+                instrument_id,
+                client_order_id,
+                order_side,
+                order_type,
+                quantity,
+                time_in_force,
+                price,
+                trigger_price,
+                reduce_only,
+                post_only,
+            ),
+        ) in orders.into_iter().enumerate()
+        {
+            match self.build_send_order_params(
+                instrument_id,
+                client_order_id,
+                order_side,
+                order_type,
+                quantity,
+                time_in_force,
+                price,
+                trigger_price,
+                reduce_only,
+                post_only,
+            ) {
+                Ok(params) => {
+                    valid_items.push(KrakenFuturesBatchSendItem::from_params(
+                        params,
+                        idx.to_string(),
+                    ));
+                    valid_indices.push(idx);
+                }
+                Err(e) => {
+                    all_statuses[idx] = Some(FuturesSendStatus {
+                        order_id: None,
+                        status: format!("validation_error: {e}"),
+                        order_events: None,
+                        cli_ord_id: None,
+                        received_time: None,
+                    });
+                }
+            }
+        }
+
+        if valid_items.is_empty() {
+            return Ok(all_statuses.into_iter().flatten().collect());
+        }
+
+        let mut batch_statuses: Vec<FuturesSendStatus> = Vec::with_capacity(valid_items.len());
+
+        for chunk in valid_items.chunks(BATCH_ORDER_LIMIT) {
+            match self.inner.submit_orders_batch(chunk.to_vec()).await {
+                Ok(response) => {
+                    if response.result == KrakenApiResult::Success {
+                        batch_statuses.extend(response.batch_status);
+                    } else {
+                        let error_msg = response
+                            .batch_status
+                            .first()
+                            .map_or("Unknown error", |s| s.status.as_str());
+                        for _ in 0..chunk.len() {
+                            batch_statuses.push(FuturesSendStatus {
+                                order_id: None,
+                                status: format!("api_error: {error_msg}"),
+                                order_events: None,
+                                cli_ord_id: None,
+                                received_time: None,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Fill remaining valid items with error statuses
+                    let remaining = valid_items.len() - batch_statuses.len();
+                    for _ in 0..remaining {
+                        batch_statuses.push(FuturesSendStatus {
+                            order_id: None,
+                            status: format!("batch_error: {e}"),
+                            order_events: None,
+                            cli_ord_id: None,
+                            received_time: None,
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Map batch statuses back to original order positions
+        for (batch_idx, &original_idx) in valid_indices.iter().enumerate() {
+            if let Some(status) = batch_statuses.get(batch_idx) {
+                all_statuses[original_idx] = Some(status.clone());
+            }
+        }
+
+        Ok(all_statuses.into_iter().flatten().collect())
+    }
+}
+
+fn parse_multi_collateral_balances(account: &FuturesAccount, balances: &mut Vec<AccountBalance>) {
+    for (currency_code, currency_info) in &account.currencies {
+        if currency_info.quantity == 0.0 {
+            continue;
+        }
+
+        let currency = Currency::new(
+            currency_code.as_str(),
+            8,
+            0,
+            currency_code.as_str(),
+            CurrencyType::Crypto,
+        );
+
+        let total_amount = currency_info.quantity;
+        let total = Money::new(total_amount, currency);
+
+        // Available can exceed quantity with positive PnL, cap to satisfy invariant
+        let available_amount = currency_info
+            .available
+            .unwrap_or(total_amount)
+            .min(total_amount);
+        let locked_amount = (total_amount - available_amount).max(0.0);
+        let locked = Money::new(locked_amount, currency);
+        let free = total - locked;
+
+        balances.push(AccountBalance::new(total, locked, free));
+    }
+
+    // Multi-collateral accounts track margin in USD even though the
+    // actual collateral is held in various crypto currencies.
+    if let Some(portfolio_value) = account.portfolio_value
+        && portfolio_value > 0.0
+    {
+        let usd_currency = Currency::USD();
+        let total_usd = Money::new(portfolio_value, usd_currency);
+        let available_usd = account
+            .available_margin
+            .unwrap_or(portfolio_value)
+            .min(portfolio_value);
+        let locked_usd = Money::new((portfolio_value - available_usd).max(0.0), usd_currency);
+        let free_usd = total_usd - locked_usd;
+
+        balances.push(AccountBalance::new(total_usd, locked_usd, free_usd));
+    }
+}
+
+fn parse_multi_collateral_margins(account: &FuturesAccount, margins: &mut Vec<MarginBalance>) {
+    if let Some(initial_margin) = account.initial_margin
+        && initial_margin > 0.0
+    {
+        let usd_currency = Currency::USD();
+        let maintenance = account
+            .margin_requirements
+            .as_ref()
+            .and_then(|mr| mr.mm)
+            .unwrap_or(0.0);
+        let margin_instrument_id = InstrumentId::new(Symbol::new("ACCOUNT"), *KRAKEN_VENUE);
+        margins.push(MarginBalance::new(
+            Money::new(initial_margin, usd_currency),
+            Money::new(maintenance, usd_currency),
+            margin_instrument_id,
+        ));
+    }
+}
+
+fn parse_margin_account_balances(account: &FuturesAccount, balances: &mut Vec<AccountBalance>) {
+    for (currency_code, &amount) in &account.balances {
+        if amount == 0.0 {
+            continue;
+        }
+
+        let currency = Currency::new(
+            currency_code.as_str(),
+            8,
+            0,
+            currency_code.as_str(),
+            CurrencyType::Crypto,
+        );
+
+        let total = Money::new(amount, currency);
+
+        // Available can exceed balance with positive PnL, cap to satisfy invariant
+        let available = account
+            .auxiliary
+            .as_ref()
+            .and_then(|aux| aux.af)
+            .unwrap_or(amount)
+            .min(amount);
+        let locked = amount - available;
+
+        balances.push(AccountBalance::new(
+            total,
+            Money::new(locked, currency),
+            Money::new(available, currency),
+        ));
+    }
+}
+
+fn parse_margin_account_margins(account: &FuturesAccount, margins: &mut Vec<MarginBalance>) {
+    if let Some(ref mr) = account.margin_requirements {
+        let im = mr.im.unwrap_or(0.0);
+        let mm = mr.mm.unwrap_or(0.0);
+        if im > 0.0 || mm > 0.0 {
+            let usd_currency = Currency::USD();
+            let margin_instrument_id = InstrumentId::new(Symbol::new("ACCOUNT"), *KRAKEN_VENUE);
+            margins.push(MarginBalance::new(
+                Money::new(im, usd_currency),
+                Money::new(mm, usd_currency),
+                margin_instrument_id,
+            ));
+        }
+    }
+}
+
+fn parse_cash_account_balances(account: &FuturesAccount, balances: &mut Vec<AccountBalance>) {
+    for (currency_code, &amount) in &account.balances {
+        if amount == 0.0 {
+            continue;
+        }
+
+        let currency = Currency::new(
+            currency_code.as_str(),
+            8,
+            0,
+            currency_code.as_str(),
+            CurrencyType::Crypto,
+        );
+
+        let total = Money::new(amount, currency);
+        let locked = Money::new(0.0, currency);
+
+        balances.push(AccountBalance::new(total, locked, total));
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use ahash::AHashMap;
     use rstest::rstest;
 
     use super::*;
@@ -2103,5 +2360,162 @@ mod tests {
         )
         .unwrap();
         assert!(client.instruments_cache.is_empty());
+    }
+
+    #[rstest]
+    fn test_parse_multi_collateral_margins() {
+        let account = FuturesAccount {
+            account_type: KrakenFuturesAccountType::MultiCollateralMarginAccount,
+            balances: AHashMap::new(),
+            currencies: AHashMap::new(),
+            auxiliary: None,
+            margin_requirements: Some(FuturesMarginRequirements {
+                im: Some(500.0),
+                mm: Some(250.0),
+                lt: None,
+                tt: None,
+            }),
+            portfolio_value: Some(10000.0),
+            available_margin: Some(9500.0),
+            initial_margin: Some(500.0),
+            pnl: None,
+        };
+
+        let mut margins = Vec::new();
+        parse_multi_collateral_margins(&account, &mut margins);
+
+        assert_eq!(margins.len(), 1);
+        let margin = &margins[0];
+        assert_eq!(margin.instrument_id.symbol.as_str(), "ACCOUNT");
+        assert_eq!(margin.instrument_id.venue.as_str(), "KRAKEN");
+        assert_eq!(margin.initial.as_f64(), 500.0);
+        assert_eq!(margin.maintenance.as_f64(), 250.0);
+    }
+
+    #[rstest]
+    fn test_parse_multi_collateral_margins_zero_skipped() {
+        let account = FuturesAccount {
+            account_type: KrakenFuturesAccountType::MultiCollateralMarginAccount,
+            balances: AHashMap::new(),
+            currencies: AHashMap::new(),
+            auxiliary: None,
+            margin_requirements: None,
+            portfolio_value: None,
+            available_margin: None,
+            initial_margin: Some(0.0),
+            pnl: None,
+        };
+
+        let mut margins = Vec::new();
+        parse_multi_collateral_margins(&account, &mut margins);
+
+        assert_eq!(margins.len(), 0);
+    }
+
+    #[rstest]
+    fn test_parse_margin_account_margins() {
+        let account = FuturesAccount {
+            account_type: KrakenFuturesAccountType::MarginAccount,
+            balances: AHashMap::new(),
+            currencies: AHashMap::new(),
+            auxiliary: None,
+            margin_requirements: Some(FuturesMarginRequirements {
+                im: Some(100.0),
+                mm: Some(50.0),
+                lt: None,
+                tt: None,
+            }),
+            portfolio_value: None,
+            available_margin: None,
+            initial_margin: None,
+            pnl: None,
+        };
+
+        let mut margins = Vec::new();
+        parse_margin_account_margins(&account, &mut margins);
+
+        assert_eq!(margins.len(), 1);
+        let margin = &margins[0];
+        assert_eq!(margin.initial.as_f64(), 100.0);
+        assert_eq!(margin.maintenance.as_f64(), 50.0);
+    }
+
+    #[rstest]
+    fn test_parse_margin_account_margins_no_requirements() {
+        let account = FuturesAccount {
+            account_type: KrakenFuturesAccountType::MarginAccount,
+            balances: AHashMap::new(),
+            currencies: AHashMap::new(),
+            auxiliary: None,
+            margin_requirements: None,
+            portfolio_value: None,
+            available_margin: None,
+            initial_margin: None,
+            pnl: None,
+        };
+
+        let mut margins = Vec::new();
+        parse_margin_account_margins(&account, &mut margins);
+
+        assert_eq!(margins.len(), 0);
+    }
+
+    #[rstest]
+    fn test_parse_multi_collateral_balances() {
+        let mut currencies = AHashMap::new();
+        currencies.insert(
+            "BTC".to_string(),
+            FuturesFlexCurrency {
+                quantity: 1.5,
+                value: None,
+                collateral: None,
+                available: Some(1.2),
+            },
+        );
+
+        let account = FuturesAccount {
+            account_type: KrakenFuturesAccountType::MultiCollateralMarginAccount,
+            balances: AHashMap::new(),
+            currencies,
+            auxiliary: None,
+            margin_requirements: None,
+            portfolio_value: Some(50000.0),
+            available_margin: Some(45000.0),
+            initial_margin: None,
+            pnl: None,
+        };
+
+        let mut balances = Vec::new();
+        parse_multi_collateral_balances(&account, &mut balances);
+
+        // BTC balance + USD portfolio balance
+        assert_eq!(balances.len(), 2);
+    }
+
+    #[rstest]
+    fn test_parse_cash_account_balances() {
+        let mut bals = AHashMap::new();
+        bals.insert("ETH".to_string(), 10.0);
+        bals.insert("BTC".to_string(), 0.0); // zero, should be skipped
+
+        let account = FuturesAccount {
+            account_type: KrakenFuturesAccountType::CashAccount,
+            balances: bals,
+            currencies: AHashMap::new(),
+            auxiliary: None,
+            margin_requirements: None,
+            portfolio_value: None,
+            available_margin: None,
+            initial_margin: None,
+            pnl: None,
+        };
+
+        let mut balances = Vec::new();
+        parse_cash_account_balances(&account, &mut balances);
+
+        assert_eq!(balances.len(), 1);
+        let balance = &balances[0];
+        assert_eq!(balance.total.as_f64(), 10.0);
+        assert_eq!(balance.locked.as_f64(), 0.0);
     }
 }

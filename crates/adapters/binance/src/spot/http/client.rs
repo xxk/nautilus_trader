@@ -29,13 +29,15 @@
 //!
 //! All requests include:
 //! - `Accept: application/sbe`
-//! - `X-MBX-SBE: 3:2` (schema ID:version)
+//! - `X-MBX-SBE: 3:3` (schema ID:version)
 
 use std::{collections::HashMap, fmt::Debug, num::NonZeroU32, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use nautilus_core::{consts::NAUTILUS_USER_AGENT, nanos::UnixNanos, time::AtomicTime};
+use nautilus_core::{
+    consts::NAUTILUS_USER_AGENT, datetime::SECONDS_IN_DAY, nanos::UnixNanos, time::AtomicTime,
+};
 use nautilus_model::{
     data::{Bar, BarType, TradeTick},
     enums::{AggregationSource, BarAggregation, OrderSide, OrderType, TimeInForce},
@@ -73,7 +75,7 @@ use crate::{
         consts::{
             BINANCE_NAUTILUS_SPOT_BROKER_ID, BINANCE_SPOT_RATE_LIMITS, BinanceRateLimitQuota,
         },
-        credential::Credential,
+        credential::SigningCredential,
         encoder::{decode_broker_id, encode_broker_id},
         enums::{
             BinanceEnvironment, BinanceProductType, BinanceRateLimitInterval, BinanceRateLimitType,
@@ -85,21 +87,23 @@ use crate::{
             parse_new_order_response_sbe, parse_order_status_report_sbe, parse_spot_instrument_sbe,
             parse_spot_trades_sbe,
         },
+        urls::get_http_base_url,
+    },
+    spot::{
+        enums::{
+            BinanceCancelReplaceMode, BinanceOrderResponseType, BinanceSpotOrderType,
+            order_type_to_binance_spot, time_in_force_to_binance_spot,
+        },
         sbe::spot::{
             ReadBuf, SBE_SCHEMA_ID, SBE_SCHEMA_VERSION,
             error_response_codec::{self, ErrorResponseDecoder},
             message_header_codec::MessageHeaderDecoder,
         },
-        urls::get_http_base_url,
-    },
-    spot::enums::{
-        BinanceCancelReplaceMode, BinanceOrderResponseType, BinanceSpotOrderType,
-        order_type_to_binance_spot, time_in_force_to_binance_spot,
     },
 };
 
 /// SBE schema header value for Spot API.
-pub const SBE_SCHEMA_HEADER: &str = "3:2";
+pub const SBE_SCHEMA_HEADER: &str = "3:3";
 
 /// Binance Spot API path.
 const SPOT_API_PATH: &str = "/api/v3";
@@ -130,7 +134,7 @@ struct RateLimitConfig {
 pub struct BinanceRawSpotHttpClient {
     client: HttpClient,
     base_url: String,
-    credential: Option<Credential>,
+    credential: Option<SigningCredential>,
     recv_window: Option<u64>,
     order_rate_keys: Vec<String>,
 }
@@ -157,7 +161,7 @@ impl BinanceRawSpotHttpClient {
         } = Self::rate_limit_config();
 
         let credential = match (api_key, api_secret) {
-            (Some(key), Some(secret)) => Some(Credential::new(key, secret)),
+            (Some(key), Some(secret)) => Some(SigningCredential::new(key, secret)),
             (None, None) => None,
             _ => return Err(BinanceSpotHttpError::MissingCredentials),
         };
@@ -224,6 +228,38 @@ impl BinanceRawSpotHttpClient {
         P: Serialize + ?Sized,
     {
         self.request(Method::GET, path, params, true, false).await
+    }
+
+    /// Performs a signed POST request and returns raw response bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn post_signed<P>(
+        &self,
+        path: &str,
+        params: Option<&P>,
+    ) -> BinanceSpotHttpResult<Vec<u8>>
+    where
+        P: Serialize + ?Sized,
+    {
+        self.request(Method::POST, path, params, true, true).await
+    }
+
+    /// Performs a signed DELETE request and returns raw response bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing or the request fails.
+    pub async fn delete_signed<P>(
+        &self,
+        path: &str,
+        params: Option<&P>,
+    ) -> BinanceSpotHttpResult<Vec<u8>>
+    where
+        P: Serialize + ?Sized,
+    {
+        self.request(Method::DELETE, path, params, true, true).await
     }
 
     async fn request<P>(
@@ -374,7 +410,7 @@ impl BinanceRawSpotHttpClient {
         Some((code, message))
     }
 
-    fn default_headers(credential: &Option<Credential>) -> HashMap<String, String> {
+    fn default_headers(credential: &Option<SigningCredential>) -> HashMap<String, String> {
         let mut headers = HashMap::new();
         headers.insert("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string());
         headers.insert("Accept".to_string(), "application/sbe".to_string());
@@ -427,7 +463,7 @@ impl BinanceRawSpotHttpClient {
             BinanceRateLimitInterval::Second => Quota::per_second(burst),
             BinanceRateLimitInterval::Minute => Some(Quota::per_minute(burst)),
             BinanceRateLimitInterval::Day => {
-                Quota::with_period(std::time::Duration::from_secs(86_400))
+                Quota::with_period(std::time::Duration::from_secs(SECONDS_IN_DAY))
                     .map(|q| q.allow_burst(burst))
             }
         }
@@ -998,7 +1034,7 @@ impl BinanceRawSpotHttpClient {
     where
         P: Serialize + ?Sized,
     {
-        self.request(Method::POST, path, params, true, true).await
+        self.post_signed(path, params).await
     }
 
     /// Performs a signed DELETE request for cancel operations.
@@ -1010,7 +1046,7 @@ impl BinanceRawSpotHttpClient {
     where
         P: Serialize + ?Sized,
     {
-        self.request(Method::DELETE, path, params, true, true).await
+        self.delete_signed(path, params).await
     }
 
     /// Creates a new order.
@@ -1281,10 +1317,6 @@ impl BinanceRawSpotHttpClient {
 /// Wraps [`BinanceRawSpotHttpClient`] and provides domain-level methods:
 /// - Simple types (ping, server_time): Pass through from raw client.
 /// - Complex types (instruments, orders): Transform to Nautilus domain types.
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", from_py_object)
-)]
 pub struct BinanceSpotHttpClient {
     inner: Arc<BinanceRawSpotHttpClient>,
     clock: &'static AtomicTime,
@@ -1588,7 +1620,13 @@ impl BinanceSpotHttpClient {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        parse_order_status_report_sbe(&order, account_id, &instrument, ts_init)
+        parse_order_status_report_sbe(
+            &order,
+            account_id,
+            &instrument,
+            BINANCE_NAUTILUS_SPOT_BROKER_ID,
+            ts_init,
+        )
     }
 
     /// Requests order status reports.
@@ -1637,7 +1675,13 @@ impl BinanceSpotHttpClient {
             .map(|order| {
                 let symbol = Ustr::from(&order.symbol);
                 let instrument = self.instrument_from_cache(symbol)?;
-                parse_order_status_report_sbe(order, account_id, &instrument, ts_init)
+                parse_order_status_report_sbe(
+                    order,
+                    account_id,
+                    &instrument,
+                    BINANCE_NAUTILUS_SPOT_BROKER_ID,
+                    ts_init,
+                )
             })
             .collect()
     }
@@ -1793,10 +1837,15 @@ impl BinanceSpotHttpClient {
                 stop_price_str.as_deref(),
                 iceberg_qty_str.as_deref(),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .await?;
 
-        parse_new_order_response_sbe(&response, account_id, &instrument, ts_init)
+        parse_new_order_response_sbe(
+            &response,
+            account_id,
+            &instrument,
+            BINANCE_NAUTILUS_SPOT_BROKER_ID,
+            ts_init,
+        )
     }
 
     /// Submits multiple orders in a single batch request.
@@ -1867,7 +1916,13 @@ impl BinanceSpotHttpClient {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        parse_new_order_response_sbe(&response, account_id, &instrument, ts_init)
+        parse_new_order_response_sbe(
+            &response,
+            account_id,
+            &instrument,
+            BINANCE_NAUTILUS_SPOT_BROKER_ID,
+            ts_init,
+        )
     }
 
     /// Cancels an existing order on the venue.
@@ -1959,14 +2014,14 @@ mod tests {
     #[rstest]
     fn test_schema_constants() {
         assert_eq!(BinanceRawSpotHttpClient::schema_id(), 3);
-        assert_eq!(BinanceRawSpotHttpClient::schema_version(), 2);
+        assert_eq!(BinanceRawSpotHttpClient::schema_version(), 3);
         assert_eq!(BinanceSpotHttpClient::schema_id(), 3);
-        assert_eq!(BinanceSpotHttpClient::schema_version(), 2);
+        assert_eq!(BinanceSpotHttpClient::schema_version(), 3);
     }
 
     #[rstest]
     fn test_sbe_schema_header() {
-        assert_eq!(SBE_SCHEMA_HEADER, "3:2");
+        assert_eq!(SBE_SCHEMA_HEADER, "3:3");
     }
 
     #[rstest]
@@ -1974,7 +2029,7 @@ mod tests {
         let headers = BinanceRawSpotHttpClient::default_headers(&None);
 
         assert_eq!(headers.get("Accept"), Some(&"application/sbe".to_string()));
-        assert_eq!(headers.get("X-MBX-SBE"), Some(&"3:2".to_string()));
+        assert_eq!(headers.get("X-MBX-SBE"), Some(&"3:3".to_string()));
     }
 
     #[rstest]

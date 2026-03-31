@@ -30,6 +30,10 @@ use crate::common::{
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
+)]
 pub struct BybitDataClientConfig {
     /// Optional API key for authenticated REST/WebSocket requests.
     pub api_key: Option<String>,
@@ -66,6 +70,9 @@ pub struct BybitDataClientConfig {
     pub recv_window_ms: Option<u64>,
     /// Optional interval (minutes) for instrument refresh from REST.
     pub update_instruments_interval_mins: Option<u64>,
+    /// Optional interval (seconds) for polling instrument status changes.
+    /// Set to `None` to disable. Defaults to `Some(60)`.
+    pub instrument_status_poll_secs: Option<u64>,
 }
 
 impl Default for BybitDataClientConfig {
@@ -87,6 +94,7 @@ impl Default for BybitDataClientConfig {
             heartbeat_interval_secs: Some(20),
             recv_window_ms: Some(5_000),
             update_instruments_interval_mins: Some(60),
+            instrument_status_poll_secs: Some(60),
         }
     }
 }
@@ -155,6 +163,10 @@ impl BybitDataClientConfig {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bybit", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
 pub struct BybitExecClientConfig {
     /// API key for authenticated requests.

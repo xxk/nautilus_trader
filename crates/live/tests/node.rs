@@ -18,15 +18,134 @@
 //! These tests use global logging state (one logger per process).
 //! Run with cargo-nextest for process isolation, or use --test-threads=1.
 
-use std::time::Duration;
+use std::{
+    fmt::Debug,
+    ops::{Deref, DerefMut},
+    time::Duration,
+};
 
-use nautilus_common::{enums::Environment, testing::wait_until_async};
+use nautilus_common::{
+    actor::{DataActor, DataActorCore, data_actor::DataActorConfig},
+    enums::Environment,
+    testing::wait_until_async,
+};
 use nautilus_live::{
     config::{LiveExecEngineConfig, LiveNodeConfig},
     node::{LiveNode, LiveNodeHandle, NodeState},
 };
-use nautilus_model::identifiers::TraderId;
+use nautilus_model::{
+    identifiers::{ExecAlgorithmId, TraderId},
+    orders::OrderAny,
+};
+use nautilus_trading::{
+    ExecutionAlgorithm, ExecutionAlgorithmConfig, ExecutionAlgorithmCore,
+    strategy::{Strategy, StrategyConfig, StrategyCore},
+};
 use rstest::rstest;
+
+#[derive(Debug)]
+struct TestActor {
+    core: DataActorCore,
+}
+
+impl TestActor {
+    fn new(config: DataActorConfig) -> Self {
+        Self {
+            core: DataActorCore::new(config),
+        }
+    }
+}
+
+impl DataActor for TestActor {}
+
+impl Deref for TestActor {
+    type Target = DataActorCore;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl DerefMut for TestActor {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
+}
+
+#[derive(Debug)]
+struct TestStrategy {
+    core: StrategyCore,
+}
+
+impl TestStrategy {
+    fn new(config: StrategyConfig) -> Self {
+        Self {
+            core: StrategyCore::new(config),
+        }
+    }
+}
+
+impl DataActor for TestStrategy {}
+
+impl Deref for TestStrategy {
+    type Target = DataActorCore;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl DerefMut for TestStrategy {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
+}
+
+impl Strategy for TestStrategy {
+    fn core(&self) -> &StrategyCore {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut StrategyCore {
+        &mut self.core
+    }
+}
+
+#[derive(Debug)]
+struct TestExecAlgorithm {
+    core: ExecutionAlgorithmCore,
+}
+
+impl TestExecAlgorithm {
+    fn new(config: ExecutionAlgorithmConfig) -> Self {
+        Self {
+            core: ExecutionAlgorithmCore::new(config),
+        }
+    }
+}
+
+impl DataActor for TestExecAlgorithm {}
+
+impl Deref for TestExecAlgorithm {
+    type Target = DataActorCore;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl DerefMut for TestExecAlgorithm {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
+}
+
+impl ExecutionAlgorithm for TestExecAlgorithm {
+    fn core_mut(&mut self) -> &mut ExecutionAlgorithmCore {
+        &mut self.core
+    }
+
+    fn on_order(&mut self, _order: OrderAny) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
 
 // -- LiveNodeHandle tests (no global state, can run in parallel) ----------------------------------
 
@@ -160,6 +279,58 @@ mod serial_tests {
     }
 
     #[rstest]
+    fn test_add_actor() {
+        let mut node = LiveNode::build("TestNode".to_string(), None).unwrap();
+
+        let actor = TestActor::new(DataActorConfig::default());
+
+        let result = node.add_actor(actor);
+
+        assert!(result.is_ok());
+    }
+
+    #[rstest]
+    fn test_add_strategy() {
+        let mut node = LiveNode::build("TestNode".to_string(), None).unwrap();
+
+        let strategy = TestStrategy::new(StrategyConfig::default());
+
+        let result = node.add_strategy(strategy);
+
+        assert!(result.is_ok());
+    }
+
+    #[rstest]
+    fn test_add_exec_algorithm() {
+        let mut node = LiveNode::build("TestNode".to_string(), None).unwrap();
+
+        let config = ExecutionAlgorithmConfig {
+            exec_algorithm_id: Some(ExecAlgorithmId::from("TEST_ALGO")),
+            ..Default::default()
+        };
+        let algo = TestExecAlgorithm::new(config);
+
+        let result = node.add_exec_algorithm(algo);
+
+        assert!(result.is_ok());
+    }
+
+    #[rstest]
+    fn test_add_exec_algorithm_registers_execute_endpoint() {
+        let mut node = LiveNode::build("TestNode".to_string(), None).unwrap();
+
+        let config = ExecutionAlgorithmConfig {
+            exec_algorithm_id: Some(ExecAlgorithmId::from("MY_ALGO")),
+            ..Default::default()
+        };
+        let algo = TestExecAlgorithm::new(config);
+
+        node.add_exec_algorithm(algo).unwrap();
+
+        assert!(nautilus_common::msgbus::has_endpoint("MY_ALGO.execute"));
+    }
+
+    #[rstest]
     fn test_handle_from_node_shares_state() {
         let node = LiveNode::build("TestNode".to_string(), None).unwrap();
         let handle = node.handle();
@@ -274,6 +445,41 @@ mod serial_tests {
         let result = node.run().await;
 
         assert!(result.is_ok());
+        assert_eq!(handle.state(), NodeState::Stopped);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_handle_stop_completes_within_timeout() {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecEngineConfig {
+                reconciliation: false,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let mut node = LiveNode::build("TestNode".to_string(), Some(config)).unwrap();
+        let handle = node.handle();
+
+        let stop_handle = handle.clone();
+        tokio::spawn(async move {
+            wait_until_async(
+                || async { stop_handle.is_running() },
+                Duration::from_secs(5),
+            )
+            .await;
+            stop_handle.stop();
+        });
+
+        // The biased select in the event loop prioritizes signals over data,
+        // so stop should complete well within 5 seconds even under load
+        let result = tokio::time::timeout(Duration::from_secs(5), node.run()).await;
+
+        assert!(
+            result.is_ok(),
+            "run() should complete within 5 seconds after stop"
+        );
         assert_eq!(handle.state(), NodeState::Stopped);
     }
 }

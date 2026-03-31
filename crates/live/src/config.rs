@@ -35,6 +35,10 @@ use serde::{Deserialize, Serialize};
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveDataEngineConfig {
     /// The queue size for the engine's internal queue buffers.
@@ -58,6 +62,10 @@ impl From<LiveDataEngineConfig> for DataEngineConfig {
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveRiskEngineConfig {
     /// The queue size for the engine's internal queue buffers.
@@ -80,6 +88,10 @@ impl From<LiveRiskEngineConfig> for RiskEngineConfig {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LiveExecEngineConfig {
@@ -189,8 +201,17 @@ impl Default for LiveExecEngineConfig {
 }
 
 impl From<LiveExecEngineConfig> for ExecutionEngineConfig {
-    fn from(_config: LiveExecEngineConfig) -> Self {
-        Self::default()
+    fn from(config: LiveExecEngineConfig) -> Self {
+        Self {
+            purge_closed_orders_interval_mins: config.purge_closed_orders_interval_mins,
+            purge_closed_orders_buffer_mins: config.purge_closed_orders_buffer_mins,
+            purge_closed_positions_interval_mins: config.purge_closed_positions_interval_mins,
+            purge_closed_positions_buffer_mins: config.purge_closed_positions_buffer_mins,
+            purge_account_events_interval_mins: config.purge_account_events_interval_mins,
+            purge_account_events_lookback_mins: config.purge_account_events_lookback_mins,
+            purge_from_database: config.purge_from_database,
+            ..Self::default()
+        }
     }
 }
 
@@ -198,6 +219,10 @@ impl From<LiveExecEngineConfig> for ExecutionEngineConfig {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RoutingConfig {
@@ -211,6 +236,10 @@ pub struct RoutingConfig {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstrumentProviderConfig {
@@ -237,6 +266,10 @@ impl Default for InstrumentProviderConfig {
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LiveDataClientConfig {
     /// If `DataClient` will emit bar updates when a new bar opens.
@@ -252,6 +285,10 @@ pub struct LiveDataClientConfig {
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LiveExecClientConfig {
     /// The client's instrument provider configuration.
@@ -264,6 +301,10 @@ pub struct LiveExecClientConfig {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.live", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.live")
 )]
 #[derive(Debug, Clone)]
 pub struct LiveNodeConfig {

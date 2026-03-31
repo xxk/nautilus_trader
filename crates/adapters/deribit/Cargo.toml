@@ -38,6 +38,7 @@ python = [
   "nautilus-system/python",
   "pyo3",
   "pyo3-async-runtimes",
+  "pyo3-stub-gen",
 ]
 high-precision = ["nautilus-model/high-precision"]
 
@@ -60,7 +61,6 @@ async-stream = { workspace = true }
 async-trait = { workspace = true }
 aws-lc-rs = { workspace = true }
 chrono = { workspace = true }
-dashmap = { workspace = true }
 derive_builder = { workspace = true }
 dotenvy = { workspace = true }
 futures-util = { workspace = true }
@@ -80,12 +80,14 @@ zeroize = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-testkit = { workspace = true }
 
 axum = { workspace = true }
 criterion = { workspace = true }
+dashmap = { workspace = true }
 iai = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }

@@ -15,6 +15,11 @@
 
 //! Python bindings from [PyO3](https://pyo3.rs).
 
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "errors documented on underlying Rust methods"
+)]
+
 pub mod actor;
 pub mod cache;
 pub mod clock;
@@ -52,6 +57,7 @@ pub fn common(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::msgbus::BusMessage>()?;
     m.add_class::<crate::msgbus::database::DatabaseConfig>()?;
     m.add_class::<crate::msgbus::database::MessageBusConfig>()?;
+    m.add_class::<crate::python::msgbus::PyMessageBus>()?;
     m.add_class::<crate::enums::ComponentState>()?;
     m.add_class::<crate::enums::ComponentTrigger>()?;
     m.add_class::<crate::enums::Environment>()?;

@@ -34,7 +34,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use nautilus_core::{
-    AtomicTime, UUID4, UnixNanos,
+    AtomicMap, AtomicTime, UUID4, UnixNanos,
     consts::{NAUTILUS_TRADER, NAUTILUS_USER_AGENT},
     env::get_or_env_var_opt,
     time::get_atomic_clock_realtime,
@@ -46,16 +46,17 @@ use nautilus_model::{
         PriceType, TimeInForce, TrailingOffsetType, TriggerType,
     },
     events::AccountState,
-    identifiers::{AccountId, ClientOrderId, InstrumentId, OrderListId, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, OrderListId, Symbol, VenueOrderId},
     instruments::{Instrument as InstrumentTrait, InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
-    types::{Price, Quantity},
+    types::{MarginBalance, Money, Price, Quantity},
 };
 use nautilus_network::{
     http::{HttpClient, Method, StatusCode, USER_AGENT},
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryManager},
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -76,13 +77,15 @@ use super::{
 };
 use crate::{
     common::{
-        consts::{BITMEX_HTTP_TESTNET_URL, BITMEX_HTTP_URL},
+        consts::{BITMEX_HTTP_TESTNET_URL, BITMEX_HTTP_URL, BITMEX_VENUE},
         credential::{Credential, credential_env_vars},
         enums::{
             BitmexContingencyType, BitmexExecInstruction, BitmexOrderStatus, BitmexOrderType,
             BitmexPegPriceType, BitmexSide, BitmexTimeInForce,
         },
-        parse::{parse_account_balance, quantity_to_u32},
+        parse::{
+            bitmex_currency_divisor, map_bitmex_currency, parse_account_balance, quantity_to_u32,
+        },
     },
     http::{
         parse::{
@@ -792,8 +795,12 @@ impl BitmexRawHttpClient {
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.bitmex", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitmex")
+)]
 pub struct BitmexHttpClient {
-    pub(crate) instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
+    pub(crate) instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
     pub(crate) order_type_cache: Arc<DashMap<ClientOrderId, OrderType>>,
     clock: &'static AtomicTime,
     inner: Arc<BitmexRawHttpClient>,
@@ -907,7 +914,7 @@ impl BitmexHttpClient {
 
         Ok(Self {
             inner: Arc::new(inner),
-            instruments_cache: Arc::new(DashMap::new()),
+            instruments_cache: Arc::new(AtomicMap::new()),
             order_type_cache: Arc::new(DashMap::new()),
             cache_initialized: AtomicBool::new(false),
             clock: get_atomic_clock_realtime(),
@@ -1231,11 +1238,21 @@ impl BitmexHttpClient {
         self.cache_initialized.store(true, Ordering::Release);
     }
 
+    /// Caches multiple instruments.
+    ///
+    /// Any existing instruments with the same symbols will be replaced.
+    pub fn cache_instruments(&self, instruments: &[InstrumentAny]) {
+        self.instruments_cache.rcu(|m| {
+            for inst in instruments {
+                m.insert(inst.raw_symbol().inner(), inst.clone());
+            }
+        });
+        self.cache_initialized.store(true, Ordering::Release);
+    }
+
     /// Gets an instrument from the cache by symbol.
     pub fn get_instrument(&self, symbol: &Ustr) -> Option<InstrumentAny> {
-        self.instruments_cache
-            .get(symbol)
-            .map(|entry| entry.value().clone())
+        self.instruments_cache.get_cloned(symbol)
     }
 
     /// Request a single instrument and parse it into a Nautilus type.
@@ -1450,6 +1467,7 @@ impl BitmexHttpClient {
             UnixNanos::from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default() as u64);
 
         let mut balances = Vec::with_capacity(margins.len());
+        let mut margins_vec = Vec::new();
         let mut latest_timestamp: Option<chrono::DateTime<chrono::Utc>> = None;
 
         for margin in margins {
@@ -1488,7 +1506,30 @@ impl BitmexHttpClient {
                 foreign_requirement: None,
             };
 
-            balances.push(parse_account_balance(&margin_msg));
+            let balance = parse_account_balance(&margin_msg);
+
+            let divisor = bitmex_currency_divisor(margin_msg.currency.as_str());
+            let initial_dec = Decimal::from(margin_msg.init_margin.unwrap_or(0).max(0)) / divisor;
+            let maintenance_dec =
+                Decimal::from(margin_msg.maint_margin.unwrap_or(0).max(0)) / divisor;
+
+            if !initial_dec.is_zero() || !maintenance_dec.is_zero() {
+                let currency = balance.total.currency;
+                let currency_str = map_bitmex_currency(margin_msg.currency.as_str());
+                let margin_instrument_id = InstrumentId::new(
+                    Symbol::from_str_unchecked(format!("ACCOUNT-{currency_str}")),
+                    *BITMEX_VENUE,
+                );
+                margins_vec.push(MarginBalance::new(
+                    Money::from_decimal(initial_dec, currency)
+                        .unwrap_or_else(|_| Money::zero(currency)),
+                    Money::from_decimal(maintenance_dec, currency)
+                        .unwrap_or_else(|_| Money::zero(currency)),
+                    margin_instrument_id,
+                ));
+            }
+
+            balances.push(balance);
         }
 
         if balances.is_empty() {
@@ -1496,7 +1537,6 @@ impl BitmexHttpClient {
         }
 
         let account_type = AccountType::Margin;
-        let margins_vec = Vec::new();
         let is_reported = true;
         let event_id = UUID4::new();
 

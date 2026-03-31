@@ -28,9 +28,8 @@ use std::{
 };
 
 use ahash::AHashMap;
-use dashmap::DashSet;
 use nautilus_common::cache::fifo::FifoCache;
-use nautilus_core::{AtomicTime, UUID4, UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_core::{AtomicSet, AtomicTime, UUID4, UnixNanos, time::get_atomic_clock_realtime};
 use nautilus_model::{
     data::{Bar, Data, InstrumentStatus},
     enums::MarketStatusAction,
@@ -221,9 +220,9 @@ pub struct DeribitWsFeedHandler {
     subscriptions_state: SubscriptionState,
     retry_manager: RetryManager<DeribitWsError>,
     instruments_cache: AHashMap<Ustr, InstrumentAny>,
-    option_greeks_subs: Arc<DashSet<InstrumentId>>,
-    mark_price_subs: Arc<DashSet<InstrumentId>>,
-    index_price_subs: Arc<DashSet<InstrumentId>>,
+    option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
+    mark_price_subs: Arc<AtomicSet<InstrumentId>>,
+    index_price_subs: Arc<AtomicSet<InstrumentId>>,
     request_id_counter: AtomicU64,
     pending_requests: AHashMap<u64, PendingRequestType>,
     account_id: Option<AccountId>,
@@ -250,9 +249,9 @@ impl DeribitWsFeedHandler {
         out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
         auth_tracker: AuthTracker,
         subscriptions_state: SubscriptionState,
-        option_greeks_subs: Arc<DashSet<InstrumentId>>,
-        mark_price_subs: Arc<DashSet<InstrumentId>>,
-        index_price_subs: Arc<DashSet<InstrumentId>>,
+        option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
+        mark_price_subs: Arc<AtomicSet<InstrumentId>>,
+        index_price_subs: Arc<AtomicSet<InstrumentId>>,
         account_id: Option<AccountId>,
         bars_timestamp_on_close: bool,
         subscribe_errors: Arc<Mutex<Vec<String>>>,
@@ -1099,16 +1098,45 @@ impl DeribitWsFeedHandler {
                             if let Some(result) = &response.result {
                                 match serde_json::from_value::<DeribitOrderMsg>(result.clone()) {
                                     Ok(order_msg) => {
-                                        // Cancel confirmed - don't emit or remove context here.
-                                        // Let user.orders stream handle the cancel event to avoid
-                                        // duplicates. The stream will use the context for correct
-                                        // trader/strategy IDs and then remove it.
+                                        let venue_order_id =
+                                            VenueOrderId::new(order_msg.order_id.as_str());
                                         log::debug!(
-                                            "Cancel confirmed: venue_order_id={}, client_order_id={}, state={} (waiting for user.orders)",
-                                            order_msg.order_id,
-                                            client_order_id,
+                                            "Cancel confirmed: venue_order_id={venue_order_id}, \
+                                            client_order_id={client_order_id}, state={}",
                                             order_msg.order_state
                                         );
+
+                                        // Emit OrderCanceled from the response path so we
+                                        // do not lose the event during a reconnection gap.
+                                        // Both paths check terminal_orders to suppress
+                                        // duplicates regardless of which arrives first.
+                                        if order_msg.order_state == "cancelled"
+                                            && !self.terminal_orders.contains(&client_order_id)
+                                        {
+                                            let instrument_name_ustr =
+                                                Ustr::from(order_msg.instrument_name.as_str());
+
+                                            if let Some(instrument) =
+                                                self.instruments_cache.get(&instrument_name_ustr)
+                                                && let Some(account_id) = self.account_id
+                                            {
+                                                let event = parse_order_canceled(
+                                                    &order_msg,
+                                                    instrument,
+                                                    account_id,
+                                                    trader_id,
+                                                    strategy_id,
+                                                    ts_init,
+                                                );
+                                                // Keep order_contexts so the subscription
+                                                // path resolves the same client_order_id
+                                                // and hits the terminal_orders dedup check
+                                                self.terminal_orders.add(client_order_id);
+                                                return Some(NautilusWsMessage::OrderCanceled(
+                                                    event,
+                                                ));
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         log::error!(
@@ -2037,6 +2065,15 @@ impl DeribitWsFeedHandler {
                                                     .push(NautilusWsMessage::OrderAccepted(event));
                                             }
                                             OrderEventType::Canceled => {
+                                                // Skip if already emitted from the cancel
+                                                // response path
+                                                if self.terminal_orders.contains(&client_order_id) {
+                                                    log::trace!(
+                                                        "Skipping duplicate OrderCanceled: client_order_id={client_order_id}"
+                                                    );
+                                                    continue;
+                                                }
+
                                                 let event = parse_order_canceled(
                                                     order,
                                                     instrument,

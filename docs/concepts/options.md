@@ -18,20 +18,24 @@ The platform defines several option instrument types:
 
 Greeks-relevant metadata varies by instrument type:
 
-- `OptionContract`, `CryptoOption` -- full Greeks inputs: `strike_price`,
+- `OptionContract`, `CryptoOption`: full Greeks inputs including `strike_price`,
   `option_kind` (CALL/PUT), `expiration_utc`, `underlying`, `multiplier`.
-- `OptionSpread` -- has `underlying` and `expiration_utc`, but no per-leg
-  `strike_price` or `option_kind`.
-- `BinaryOption` -- has `expiration_utc` and `outcome`/`description`, but no
+- `OptionSpread`: a combination of up to 4 option legs, each weighted by a
+  ratio. Has `underlying`, `expiration_utc`, and `strategy_type` (vertical,
+  calendar, straddle, etc.). Per-leg `strike_price` and `option_kind` live on
+  each leg's `OptionContract`, not on the spread itself. Greeks are computed
+  per leg and aggregated. Spreads are commonly used for orders (the exchange
+  executes as a single order), while the individual legs appear as positions.
+- `BinaryOption`: has `expiration_utc` and `outcome`/`description`, but no
   `strike_price`, `option_kind`, or `underlying`.
 
 ## Subscribing to Greeks
 
-Venues like Deribit and Bybit publish real-time Greeks alongside their options markets.
+Venues like Deribit, Bybit, and OKX publish real-time Greeks alongside their options markets.
 Nautilus provides two subscription levels:
 
-- **Per-instrument Greeks** -- subscribe to individual option contracts.
-- **Option chain slices** -- subscribe to an aggregated view of an entire option series.
+- **Per-instrument Greeks**: subscribe to individual option contracts.
+- **Option chain slices**: subscribe to an aggregated view of an entire option series.
 
 ### Per-instrument Greeks
 
@@ -264,12 +268,12 @@ and an optional `greeks` (`OptionGreeks`) for that strike.
 
 Methods:
 
-- `strikes()` -- all unique strike prices in the chain.
-- `strike_count()`, `call_count()`, `put_count()` -- counts.
-- `get_call(strike)`, `get_put(strike)` -- full `OptionStrikeData`.
-- `get_call_greeks(strike)`, `get_put_greeks(strike)` -- Greeks only.
-- `get_call_quote(strike)`, `get_put_quote(strike)` -- quote only.
-- `is_empty()` -- true if the chain has no data.
+- `strikes()`: all unique strike prices in the chain.
+- `strike_count()`, `call_count()`, `put_count()`: counts.
+- `get_call(strike)`, `get_put(strike)`: full `OptionStrikeData`.
+- `get_call_greeks(strike)`, `get_put_greeks(strike)`: Greeks only.
+- `get_call_quote(strike)`, `get_put_quote(strike)`: quote only.
+- `is_empty()`: true if the chain has no data.
 
 ## Adapter support
 
@@ -279,9 +283,10 @@ The following adapters currently support option Greeks subscriptions:
 |---------|:---------------------:|:-------------:|
 | Deribit | ✓                     | ✓             |
 | Bybit   | ✓                     | ✓             |
+| OKX     | ✓                     | -             |
 
 ## See also
 
-- [Greeks](greeks.md) -- local Greeks calculation and portfolio risk management.
-- [Data](data.md) -- built-in data types and the subscription model.
-- [Actors](actors.md) -- subscription and handler reference table.
+- [Greeks](greeks.md) - Local Greeks calculation and portfolio risk management.
+- [Data](data.md) - Built-in data types and the subscription model.
+- [Actors](actors.md) - Subscription and handler reference table.

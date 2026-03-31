@@ -26,7 +26,7 @@ use std::{
 use bytes::Bytes;
 use indexmap::IndexMap;
 use log::LevelFilter;
-use nautilus_core::{UnixNanos, python::to_pytype_err};
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{
         Bar, BarType, BookOrder, CustomData, DataType, FundingRateUpdate, HasTsInit,
@@ -124,12 +124,6 @@ impl CustomDataTrait for TestActorCustomData {
         } else {
             false
         }
-    }
-    #[cfg(feature = "python")]
-    fn to_pyobject(&self, _py: pyo3::Python<'_>) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
-        Err(to_pytype_err(
-            "to_pyobject not implemented for TestActorCustomData",
-        ))
     }
 }
 
@@ -1001,6 +995,7 @@ fn test_request_funding_rates(
         audusd_sim.id,
         dec!(0.0001),
         None,
+        None,
         UnixNanos::default(),
         UnixNanos::default(),
     );
@@ -1192,6 +1187,7 @@ fn test_subscribe_and_receive_funding_rates(
         audusd_sim.id,
         "0.0001".parse().unwrap(),
         None,
+        None,
         UnixNanos::from(1),
         UnixNanos::from(2),
     );
@@ -1199,6 +1195,7 @@ fn test_subscribe_and_receive_funding_rates(
     let fr2 = FundingRateUpdate::new(
         audusd_sim.id,
         "0.0002".parse().unwrap(),
+        None,
         None,
         UnixNanos::from(3),
         UnixNanos::from(4),
@@ -1498,6 +1495,7 @@ fn test_unsubscribe_funding_rates(
         audusd_sim.id,
         "0.0001".parse().unwrap(),
         None,
+        None,
         UnixNanos::from(1),
         UnixNanos::from(2),
     );
@@ -1510,6 +1508,7 @@ fn test_unsubscribe_funding_rates(
     let fr2 = FundingRateUpdate::new(
         audusd_sim.id,
         "0.0002".parse().unwrap(),
+        None,
         None,
         UnixNanos::from(3),
         UnixNanos::from(4),

@@ -29,11 +29,11 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use dashmap::{DashMap, DashSet};
 use futures_util::Stream;
 use nautilus_common::{enums::LogColor, live::get_runtime, log_info};
 use nautilus_core::{
-    consts::NAUTILUS_USER_AGENT, env::get_or_env_var_opt, time::get_atomic_clock_realtime,
+    AtomicMap, AtomicSet, consts::NAUTILUS_USER_AGENT, env::get_or_env_var_opt,
+    time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     data::BarType,
@@ -82,6 +82,10 @@ const AUTHENTICATION_TIMEOUT_SECS: u64 = 30;
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.deribit", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.deribit")
+)]
 pub struct DeribitWebSocketClient {
     url: String,
     is_testnet: bool,
@@ -95,10 +99,10 @@ pub struct DeribitWebSocketClient {
     out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<NautilusWsMessage>>>,
     task_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     subscriptions_state: SubscriptionState,
-    instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
-    option_greeks_subs: Arc<DashSet<InstrumentId>>,
-    mark_price_subs: Arc<DashSet<InstrumentId>>,
-    index_price_subs: Arc<DashSet<InstrumentId>>,
+    instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
+    option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
+    mark_price_subs: Arc<AtomicSet<InstrumentId>>,
+    index_price_subs: Arc<AtomicSet<InstrumentId>>,
     cancellation_token: CancellationToken,
     account_id: Option<AccountId>,
     bars_timestamp_on_close: bool,
@@ -194,10 +198,10 @@ impl DeribitWebSocketClient {
             out_rx: None,
             task_handle: None,
             subscriptions_state,
-            instruments_cache: Arc::new(DashMap::new()),
-            option_greeks_subs: Arc::new(DashSet::new()),
-            mark_price_subs: Arc::new(DashSet::new()),
-            index_price_subs: Arc::new(DashSet::new()),
+            instruments_cache: Arc::new(AtomicMap::new()),
+            option_greeks_subs: Arc::new(AtomicSet::new()),
+            mark_price_subs: Arc::new(AtomicSet::new()),
+            index_price_subs: Arc::new(AtomicSet::new()),
             cancellation_token: CancellationToken::new(),
             account_id: None,
             bars_timestamp_on_close: true,
@@ -367,12 +371,29 @@ impl DeribitWebSocketClient {
     }
 
     /// Caches instruments for use during message parsing.
-    pub fn cache_instruments(&self, instruments: Vec<InstrumentAny>) {
-        for inst in instruments {
-            self.instruments_cache
-                .insert(inst.raw_symbol().inner(), inst);
-        }
+    pub fn cache_instruments(&self, instruments: &[InstrumentAny]) {
+        self.instruments_cache.rcu(|m| {
+            for inst in instruments {
+                m.insert(inst.raw_symbol().inner(), inst.clone());
+            }
+        });
         log::debug!("Cached {} instruments", self.instruments_cache.len());
+
+        // Send per-instrument updates to the live handler rather than
+        // a full snapshot, avoiding out-of-order snapshot races.
+        if self.is_active() {
+            for inst in instruments {
+                let tx = self.cmd_tx.clone();
+                let boxed = Box::new(inst.clone());
+
+                get_runtime().spawn(async move {
+                    let _ = tx
+                        .read()
+                        .await
+                        .send(HandlerCommand::UpdateInstrument(boxed));
+                });
+            }
+        }
     }
 
     /// Caches a single instrument.
@@ -383,7 +404,7 @@ impl DeribitWebSocketClient {
         // If connected, send update to handler
         if self.is_active() {
             let tx = self.cmd_tx.clone();
-            let inst = self.instruments_cache.get(&symbol).map(|r| r.clone());
+            let inst = self.instruments_cache.get_cloned(&symbol);
             if let Some(inst) = inst {
                 get_runtime().spawn(async move {
                     let _ = tx
@@ -396,17 +417,17 @@ impl DeribitWebSocketClient {
     }
 
     /// Sets the shared option greeks subscription set for handler-side gating.
-    pub fn set_option_greeks_subs(&mut self, subs: Arc<DashSet<InstrumentId>>) {
+    pub fn set_option_greeks_subs(&mut self, subs: Arc<AtomicSet<InstrumentId>>) {
         self.option_greeks_subs = subs;
     }
 
     /// Sets the shared mark price subscription set for handler-side gating.
-    pub fn set_mark_price_subs(&mut self, subs: Arc<DashSet<InstrumentId>>) {
+    pub fn set_mark_price_subs(&mut self, subs: Arc<AtomicSet<InstrumentId>>) {
         self.mark_price_subs = subs;
     }
 
     /// Sets the shared index price subscription set for handler-side gating.
-    pub fn set_index_price_subs(&mut self, subs: Arc<DashSet<InstrumentId>>) {
+    pub fn set_index_price_subs(&mut self, subs: Arc<AtomicSet<InstrumentId>>) {
         self.index_price_subs = subs;
     }
 
@@ -436,8 +457,10 @@ impl DeribitWebSocketClient {
             handle.abort();
         }
 
-        // Reset stop signal
+        // Reset stop signal and subscription state so callers can
+        // resubscribe cleanly after a manual disconnect/connect cycle.
         self.signal.store(false, Ordering::Relaxed);
+        self.subscriptions_state.clear();
 
         // Create message handler and channel
         let (message_handler, raw_rx) = channel_message_handler();
@@ -519,7 +542,7 @@ impl DeribitWebSocketClient {
 
         // Replay cached instruments
         let instruments: Vec<InstrumentAny> =
-            self.instruments_cache.iter().map(|r| r.clone()).collect();
+            self.instruments_cache.load().values().cloned().collect();
 
         if !instruments.is_empty() {
             log::debug!(
@@ -879,13 +902,17 @@ impl DeribitWebSocketClient {
             return Ok(());
         }
 
-        self.cmd_tx
-            .read()
-            .await
-            .send(HandlerCommand::Subscribe {
-                channels: channels_to_subscribe.clone(),
-            })
-            .map_err(|e| DeribitWsError::Send(e.to_string()))?;
+        if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Subscribe {
+            channels: channels_to_subscribe.clone(),
+        }) {
+            // Roll back: remove reference and clear pending_subscribe
+            for channel in &channels_to_subscribe {
+                self.subscriptions_state.remove_reference(channel);
+                self.subscriptions_state.mark_unsubscribe(channel);
+                self.subscriptions_state.confirm_unsubscribe(channel);
+            }
+            return Err(DeribitWsError::Send(e.to_string()));
+        }
 
         log::debug!(
             "Sent subscribe for {} channels",
@@ -910,13 +937,22 @@ impl DeribitWebSocketClient {
             return Ok(());
         }
 
-        self.cmd_tx
-            .read()
-            .await
-            .send(HandlerCommand::Unsubscribe {
-                channels: channels_to_unsubscribe.clone(),
-            })
-            .map_err(|e| DeribitWsError::Send(e.to_string()))?;
+        if let Err(e) = self.cmd_tx.read().await.send(HandlerCommand::Unsubscribe {
+            channels: channels_to_unsubscribe.clone(),
+        }) {
+            // Send only fails when the handler task is dead, meaning the
+            // connection is broken. Restore refcount and mark confirmed so
+            // the topic is not wedged in pending_unsubscribe. This may
+            // promote a pending_subscribe topic to confirmed, but that is
+            // harmless: connect() calls clear() on the next connection
+            // attempt, resetting all subscription state.
+            for channel in &channels_to_unsubscribe {
+                self.subscriptions_state.confirm_unsubscribe(channel);
+                self.subscriptions_state.add_reference(channel);
+                self.subscriptions_state.confirm_subscribe(channel);
+            }
+            return Err(DeribitWsError::Send(e.to_string()));
+        }
 
         log::debug!(
             "Sent unsubscribe for {} channels",

@@ -41,7 +41,7 @@ pub mod twap;
 
 pub use core::{ExecutionAlgorithmCore, StrategyEventHandlers};
 
-pub use config::ExecutionAlgorithmConfig;
+pub use config::{ExecutionAlgorithmConfig, ImportableExecAlgorithmConfig};
 use nautilus_common::{
     actor::{DataActor, registry::try_get_actor_unchecked},
     enums::ComponentState,
@@ -504,6 +504,7 @@ pub trait ExecutionAlgorithm: DataActor {
             None, // price
             None, // trigger_price
             None, // protection_price
+            primary.is_quote_quantity(),
         );
 
         primary
@@ -577,6 +578,7 @@ pub trait ExecutionAlgorithm: DataActor {
             None, // price
             None, // trigger_price
             None, // protection_price
+            primary.is_quote_quantity(),
         );
 
         if let Err(e) = primary.apply(OrderEventAny::Updated(updated)) {
@@ -816,6 +818,7 @@ pub trait ExecutionAlgorithm: DataActor {
             price,
             trigger_price,
             None, // protection_price
+            order.is_quote_quantity(),
         );
 
         order

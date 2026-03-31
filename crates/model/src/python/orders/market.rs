@@ -49,7 +49,9 @@ use crate::{
 };
 
 #[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl MarketOrder {
+    /// Creates a new `MarketOrder` instance.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (trader_id, strategy_id, instrument_id, client_order_id, order_side, quantity, init_id, ts_init, time_in_force, reduce_only, quote_quantity, contingency_type=None, order_list_id=None, linked_order_ids=None, parent_order_id=None, exec_algorithm_id=None, exec_algorithm_params=None, exec_spawn_id=None, tags=None))]
@@ -284,7 +286,6 @@ impl MarketOrder {
             .map(|vec| vec.iter().map(|s| s.as_str()).collect())
     }
 
-    #[getter]
     #[pyo3(name = "events")]
     fn py_events(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         self.events()

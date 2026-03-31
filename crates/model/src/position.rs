@@ -52,6 +52,10 @@ use crate::{
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.model")
+)]
 pub struct Position {
     pub events: Vec<OrderFilled>,
     pub adjustments: Vec<PositionAdjusted>,
@@ -85,7 +89,8 @@ pub struct Position {
     pub avg_px_close: Option<f64>,
     pub realized_return: f64,
     pub realized_pnl: Option<Money>,
-    pub trade_ids: Vec<TradeId>,
+    #[serde(with = "nautilus_core::serialization::sorted_hashset")]
+    pub trade_ids: AHashSet<TradeId>,
     pub buy_qty: Quantity,
     pub sell_qty: Quantity,
     pub commissions: AHashMap<Currency, Money>,
@@ -115,7 +120,7 @@ impl Position {
         let mut item = Self {
             events: Vec::<OrderFilled>::new(),
             adjustments: Vec::<PositionAdjusted>::new(),
-            trade_ids: Vec::<TradeId>::new(),
+            trade_ids: AHashSet::<TradeId>::new(),
             buy_qty: Quantity::zero(instrument.size_precision()),
             sell_qty: Quantity::zero(instrument.size_precision()),
             commissions: AHashMap::<Currency, Money>::new(),
@@ -217,7 +222,7 @@ impl Position {
 
         // Reset mutable state
         self.events = Vec::new();
-        self.trade_ids = Vec::new();
+        self.trade_ids = AHashSet::new();
         self.adjustments = Vec::new();
         self.buy_qty = Quantity::zero(size_precision);
         self.sell_qty = Quantity::zero(size_precision);
@@ -297,7 +302,7 @@ impl Position {
         }
 
         self.events.push(*fill);
-        self.trade_ids.push(fill.trade_id);
+        self.trade_ids.insert(fill.trade_id);
 
         // Calculate cumulative commissions
         if let Some(commission) = fill.commission {
@@ -843,7 +848,7 @@ impl Position {
     /// Returns the last `TradeId` for the position (if any after purging).
     #[must_use]
     pub fn last_trade_id(&self) -> Option<TradeId> {
-        self.trade_ids.last().copied()
+        self.events.last().map(|e| e.trade_id)
     }
 
     /// Returns whether the position is long (positive quantity).
@@ -2394,7 +2399,7 @@ mod tests {
         assert_eq!(position.events.len(), 1);
         assert_eq!(position.trade_ids.len(), 1);
         assert_eq!(position.events[0].client_order_id, order2.client_order_id());
-        assert_eq!(position.trade_ids[0], TradeId::new("2"));
+        assert!(position.trade_ids.contains(&TradeId::new("2")));
     }
 
     #[rstest]
