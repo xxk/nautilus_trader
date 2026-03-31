@@ -979,62 +979,62 @@ async fn drain_buffer(pool: &PgPool, buffer: &mut VecDeque<DatabaseQuery>) {
             }
             DatabaseQuery::AddInstrument(instrument_any) => match instrument_any {
                 InstrumentAny::Betting(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "BETTING", Box::new(instrument)).await
+                    DatabaseQueries::add_instrument(pool, "BETTING", InstrumentAny::Betting(instrument)).await
                 }
                 InstrumentAny::BinaryOption(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "BINARY_OPTION", Box::new(instrument))
+                    DatabaseQueries::add_instrument(pool, "BINARY_OPTION", InstrumentAny::BinaryOption(instrument))
                         .await
                 }
                 InstrumentAny::CryptoFuture(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "CRYPTO_FUTURE", Box::new(instrument))
+                    DatabaseQueries::add_instrument(pool, "CRYPTO_FUTURE", InstrumentAny::CryptoFuture(instrument))
                         .await
                 }
                 InstrumentAny::CryptoOption(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "CRYPTO_OPTION", Box::new(instrument))
+                    DatabaseQueries::add_instrument(pool, "CRYPTO_OPTION", InstrumentAny::CryptoOption(instrument))
                         .await
                 }
                 InstrumentAny::CryptoPerpetual(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "CRYPTO_PERPETUAL", Box::new(instrument))
+                    DatabaseQueries::add_instrument(pool, "CRYPTO_PERPETUAL", InstrumentAny::CryptoPerpetual(instrument))
                         .await
                 }
                 InstrumentAny::CurrencyPair(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "CURRENCY_PAIR", Box::new(instrument))
+                    DatabaseQueries::add_instrument(pool, "CURRENCY_PAIR", InstrumentAny::CurrencyPair(instrument))
                         .await
                 }
                 InstrumentAny::Equity(equity) => {
-                    DatabaseQueries::add_instrument(pool, "EQUITY", Box::new(equity)).await
+                    DatabaseQueries::add_instrument(pool, "EQUITY", InstrumentAny::Equity(equity)).await
                 }
                 InstrumentAny::FuturesContract(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "FUTURES_CONTRACT", Box::new(instrument))
+                    DatabaseQueries::add_instrument(pool, "FUTURES_CONTRACT", InstrumentAny::FuturesContract(instrument))
                         .await
                 }
                 InstrumentAny::FuturesSpread(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "FUTURES_SPREAD", Box::new(instrument))
+                    DatabaseQueries::add_instrument(pool, "FUTURES_SPREAD", InstrumentAny::FuturesSpread(instrument))
                         .await
                 }
                 InstrumentAny::OptionContract(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "OPTION_CONTRACT", Box::new(instrument))
+                    DatabaseQueries::add_instrument(pool, "OPTION_CONTRACT", InstrumentAny::OptionContract(instrument))
                         .await
                 }
                 InstrumentAny::Commodity(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "COMMODITY", Box::new(instrument)).await
+                    DatabaseQueries::add_instrument(pool, "COMMODITY", InstrumentAny::Commodity(instrument)).await
                 }
                 InstrumentAny::IndexInstrument(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "INDEX_INSTRUMENT", Box::new(instrument))
+                    DatabaseQueries::add_instrument(pool, "INDEX_INSTRUMENT", InstrumentAny::IndexInstrument(instrument))
                         .await
                 }
                 InstrumentAny::Cfd(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "CFD", Box::new(instrument)).await
+                    DatabaseQueries::add_instrument(pool, "CFD", InstrumentAny::Cfd(instrument)).await
                 }
                 InstrumentAny::OptionSpread(instrument) => {
-                    DatabaseQueries::add_instrument(pool, "OPTION_SPREAD", Box::new(instrument))
+                    DatabaseQueries::add_instrument(pool, "OPTION_SPREAD", InstrumentAny::OptionSpread(instrument))
                         .await
                 }
                 InstrumentAny::PerpetualContract(instrument) => {
                     DatabaseQueries::add_instrument(
                         pool,
                         "PERPETUAL_CONTRACT",
-                        Box::new(instrument),
+                        InstrumentAny::PerpetualContract(instrument),
                     )
                     .await
                 }

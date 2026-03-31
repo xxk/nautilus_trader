@@ -15,6 +15,7 @@
 
 use ahash::AHashMap;
 use nautilus_common::signal::Signal;
+use nautilus_core::Params;
 use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{Bar, CustomData, DataType, HasTsInit, QuoteTick, TradeTick},
@@ -27,7 +28,7 @@ use nautilus_model::{
     orders::{Order, OrderAny},
     types::{AccountBalance, Currency, MarginBalance},
 };
-use sqlx::{PgPool, Row};
+use sqlx::{FromRow, PgPool, Row, postgres::PgRow};
 
 use super::models::{
     orders::OrderSnapshotModel, positions::PositionSnapshotModel, types::SignalModel,
@@ -143,6 +144,164 @@ impl DatabaseQueries {
             .map_err(|e| anyhow::anyhow!("Failed to load currency: {e}"))
     }
 
+    fn extract_instrument_info(instrument: &InstrumentAny) -> Option<Params> {
+        match instrument {
+            InstrumentAny::Betting(inst) => inst.info.clone(),
+            InstrumentAny::BinaryOption(inst) => inst.info.clone(),
+            InstrumentAny::Cfd(inst) => inst.info.clone(),
+            InstrumentAny::Commodity(inst) => inst.info.clone(),
+            InstrumentAny::CryptoFuture(inst) => inst.info.clone(),
+            InstrumentAny::CryptoOption(inst) => inst.info.clone(),
+            InstrumentAny::CryptoPerpetual(inst) => inst.info.clone(),
+            InstrumentAny::CurrencyPair(inst) => inst.info.clone(),
+            InstrumentAny::Equity(inst) => inst.info.clone(),
+            InstrumentAny::FuturesContract(inst) => inst.info.clone(),
+            InstrumentAny::FuturesSpread(inst) => inst.info.clone(),
+            InstrumentAny::IndexInstrument(inst) => inst.info.clone(),
+            InstrumentAny::OptionContract(inst) => inst.info.clone(),
+            InstrumentAny::OptionSpread(inst) => inst.info.clone(),
+            InstrumentAny::PerpetualContract(inst) => inst.info.clone(),
+        }
+    }
+
+    fn apply_instrument_info(instrument: InstrumentAny, info: Option<Params>) -> InstrumentAny {
+        match instrument {
+            InstrumentAny::Betting(mut inst) => {
+                inst.info = info;
+                InstrumentAny::Betting(inst)
+            }
+            InstrumentAny::BinaryOption(mut inst) => {
+                inst.info = info;
+                InstrumentAny::BinaryOption(inst)
+            }
+            InstrumentAny::Cfd(mut inst) => {
+                inst.info = info;
+                InstrumentAny::Cfd(inst)
+            }
+            InstrumentAny::Commodity(mut inst) => {
+                inst.info = info;
+                InstrumentAny::Commodity(inst)
+            }
+            InstrumentAny::CryptoFuture(mut inst) => {
+                inst.info = info;
+                InstrumentAny::CryptoFuture(inst)
+            }
+            InstrumentAny::CryptoOption(mut inst) => {
+                inst.info = info;
+                InstrumentAny::CryptoOption(inst)
+            }
+            InstrumentAny::CryptoPerpetual(mut inst) => {
+                inst.info = info;
+                InstrumentAny::CryptoPerpetual(inst)
+            }
+            InstrumentAny::CurrencyPair(mut inst) => {
+                inst.info = info;
+                InstrumentAny::CurrencyPair(inst)
+            }
+            InstrumentAny::Equity(mut inst) => {
+                inst.info = info;
+                InstrumentAny::Equity(inst)
+            }
+            InstrumentAny::FuturesContract(mut inst) => {
+                inst.info = info;
+                InstrumentAny::FuturesContract(inst)
+            }
+            InstrumentAny::FuturesSpread(mut inst) => {
+                inst.info = info;
+                InstrumentAny::FuturesSpread(inst)
+            }
+            InstrumentAny::IndexInstrument(mut inst) => {
+                inst.info = info;
+                InstrumentAny::IndexInstrument(inst)
+            }
+            InstrumentAny::OptionContract(mut inst) => {
+                inst.info = info;
+                InstrumentAny::OptionContract(inst)
+            }
+            InstrumentAny::OptionSpread(mut inst) => {
+                inst.info = info;
+                InstrumentAny::OptionSpread(inst)
+            }
+            InstrumentAny::PerpetualContract(mut inst) => {
+                inst.info = info;
+                InstrumentAny::PerpetualContract(inst)
+            }
+        }
+    }
+
+    async fn sync_instrument_metadata(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        instrument_id: &str,
+        info: Option<Params>,
+        ts_event: &str,
+        ts_init: &str,
+    ) -> anyhow::Result<()> {
+        match info {
+            Some(info) => {
+                let info_json = serde_json::to_value(info).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to serialize instrument metadata for {instrument_id}: {e}"
+                    )
+                })?;
+
+                sqlx::query(
+                    r#"
+                    INSERT INTO instrument_metadata (instrument_id, info, ts_event, ts_init, created_at, updated_at)
+                    VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT (instrument_id)
+                    DO UPDATE
+                    SET info = $2, ts_event = $3, ts_init = $4, updated_at = CURRENT_TIMESTAMP
+                    "#,
+                )
+                .bind(instrument_id)
+                .bind(info_json)
+                .bind(ts_event)
+                .bind(ts_init)
+                .execute(&mut **tx)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to upsert instrument metadata for {instrument_id}: {e}"
+                    )
+                })
+            }
+            None => sqlx::query("DELETE FROM instrument_metadata WHERE instrument_id = $1")
+                .bind(instrument_id)
+                .execute(&mut **tx)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to delete instrument metadata for {instrument_id}: {e}"
+                    )
+                }),
+        }
+    }
+
+    fn instrument_from_row(row: &PgRow) -> anyhow::Result<InstrumentAny> {
+        let instrument_id = row.try_get::<String, _>("id").map_err(|e| {
+            anyhow::anyhow!("Failed to read instrument id from row: {e}")
+        })?;
+
+        let instrument = InstrumentAnyModel::from_row(row)
+            .map(|model| model.0)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize instrument {instrument_id}: {e}"))?;
+
+        let info = row
+            .try_get::<Option<serde_json::Value>, _>("info")
+            .map_err(|e| anyhow::anyhow!("Failed to read metadata for {instrument_id}: {e}"))?
+            .map(|value| serde_json::from_value::<Params>(value))
+            .transpose()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to deserialize instrument metadata for {instrument_id}: {e}"
+                )
+            })?;
+
+        Ok(Self::apply_instrument_info(instrument, info))
+    }
+
     /// Inserts or updates an `InstrumentAny` entry via the provided `pool`.
     ///
     /// # Errors
@@ -151,8 +310,16 @@ impl DatabaseQueries {
     pub async fn add_instrument(
         pool: &PgPool,
         kind: &str,
-        instrument: Box<dyn Instrument>,
+        instrument: InstrumentAny,
     ) -> anyhow::Result<()> {
+        let instrument_id = instrument.id().to_string();
+        let ts_init = Instrument::ts_init(&instrument).to_string();
+        let ts_event = instrument.ts_event().to_string();
+        let info = Self::extract_instrument_info(&instrument);
+        let mut tx = pool.begin().await.map_err(|e| {
+            anyhow::anyhow!("Failed to begin instrument transaction for {instrument_id}: {e}")
+        })?;
+
         sqlx::query(r#"
             INSERT INTO "instrument" (
                 id, kind, raw_symbol, base_currency, underlying, quote_currency, settlement_currency, isin, asset_class, exchange,
@@ -199,12 +366,24 @@ impl DatabaseQueries {
             .bind(instrument.min_notional().map(|x| x.to_string()))
             .bind(instrument.max_price().map(|x| x.to_string()))
             .bind(instrument.min_price().map(|x| x.to_string()))
-            .bind(instrument.ts_init().to_string())
-            .bind(instrument.ts_event().to_string())
-            .execute(pool)
+            .bind(ts_init.as_str())
+            .bind(ts_event.as_str())
+            .execute(&mut *tx)
             .await
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("Failed to insert item {} into instrument table: {:?}", instrument.id(), e))
+            .map_err(|e| anyhow::anyhow!("Failed to upsert instrument {instrument_id}: {e}"))?;
+
+        Self::sync_instrument_metadata(
+            &mut tx,
+            instrument_id.as_str(),
+            info,
+            ts_event.as_str(),
+            ts_init.as_str(),
+        )
+        .await?;
+
+        tx.commit().await.map_err(|e| {
+            anyhow::anyhow!("Failed to commit instrument transaction for {instrument_id}: {e}")
+        })
     }
 
     /// Loads a single `InstrumentAny` entry by `instrument_id` via the provided `pool`.
@@ -216,14 +395,23 @@ impl DatabaseQueries {
         pool: &PgPool,
         instrument_id: &InstrumentId,
     ) -> anyhow::Result<Option<InstrumentAny>> {
-        sqlx::query_as::<_, InstrumentAnyModel>("SELECT * FROM instrument WHERE id = $1")
+        sqlx::query(
+            r#"
+            SELECT instrument.*, instrument_metadata.info AS info
+            FROM instrument
+            LEFT JOIN instrument_metadata
+                ON instrument.id = instrument_metadata.instrument_id
+            WHERE instrument.id = $1
+            "#,
+        )
             .bind(instrument_id.to_string())
             .fetch_optional(pool)
             .await
-            .map(|instrument| instrument.map(|row| row.0))
             .map_err(|e| {
-                anyhow::anyhow!("Failed to load instrument with id {instrument_id},error is: {e}")
-            })
+                anyhow::anyhow!("Failed to load instrument with id {instrument_id}, error is: {e}")
+            })?
+            .map(|row| Self::instrument_from_row(&row))
+            .transpose()
     }
 
     /// Loads all `InstrumentAny` entries via the provided `pool`.
@@ -232,11 +420,21 @@ impl DatabaseQueries {
     ///
     /// Returns an error if the SELECT operation fails.
     pub async fn load_instruments(pool: &PgPool) -> anyhow::Result<Vec<InstrumentAny>> {
-        sqlx::query_as::<_, InstrumentAnyModel>("SELECT * FROM instrument")
+        sqlx::query(
+            r#"
+            SELECT instrument.*, instrument_metadata.info AS info
+            FROM instrument
+            LEFT JOIN instrument_metadata
+                ON instrument.id = instrument_metadata.instrument_id
+            ORDER BY instrument.id ASC
+            "#,
+        )
             .fetch_all(pool)
             .await
-            .map(|rows| rows.into_iter().map(|row| row.0).collect())
-            .map_err(|e| anyhow::anyhow!("Failed to load instruments: {e}"))
+            .map_err(|e| anyhow::anyhow!("Failed to load instruments: {e}"))?
+            .into_iter()
+            .map(|row| Self::instrument_from_row(&row))
+            .collect()
     }
 
     /// Inserts or updates an `OrderAny` entry via the provided `pool`.

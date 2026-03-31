@@ -60,10 +60,6 @@ def _live_test_logging_config() -> LoggingConfig:
 
 
 @pytest.mark.xdist_group(name="redis_integration")
-@pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="Redis live cache integration is only exercised on Linux in this suite",
-)
 class TestTradingNodeCacheFlushOnStart:
     """
     Tests that kernel skips load_cache() when flush_on_start=True.
@@ -95,12 +91,20 @@ class TestTradingNodeCacheFlushOnStart:
             clock=self.clock,
         )
 
-        self.database = CacheDatabaseAdapter(
-            trader_id=self.trader_id,
-            instance_id=UUID4(),
-            serializer=MsgSpecSerializer(encoding=msgspec.msgpack, timestamps_as_str=True),
-            config=CacheConfig(database=DatabaseConfig()),
-        )
+        try:
+            self.database = CacheDatabaseAdapter(
+                trader_id=self.trader_id,
+                instance_id=UUID4(),
+                serializer=MsgSpecSerializer(encoding=msgspec.msgpack, timestamps_as_str=True),
+                config=CacheConfig(database=DatabaseConfig()),
+            )
+            self.database.flush()
+        except BaseException as e:
+            message = str(e)
+            if "connection" in message.lower() or "10061" in message:
+                pytest.skip("Redis service not available; skipping TradingNode Redis integration tests.")
+                return
+            raise
 
     def teardown(self):
         time.sleep(0.2)

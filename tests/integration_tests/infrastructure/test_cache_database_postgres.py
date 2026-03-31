@@ -15,7 +15,6 @@
 
 import asyncio
 import os
-import sys
 
 import pytest
 
@@ -61,12 +60,7 @@ _TEST_TIMEOUT = 5.0
 _AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
 
 # Requirements:
-# - A Postgres service listening on the default port 5432 (e.g. `makeinit-services`)
-
-pytestmark = pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="databases only supported on Linux",
-)
+# - A Postgres service listening on the default port 5432
 
 
 @pytest.mark.xdist_group(name="postgres_integration")
@@ -125,6 +119,34 @@ class TestCachePostgresAdapter:
         if database is not None:
             database.flush()
             database.dispose()
+
+    @staticmethod
+    def _make_audusd_with_info(info: dict | None, ts_event: int = 0, ts_init: int = 0):
+        return CurrencyPair(
+            instrument_id=_AUDUSD_SIM.id,
+            raw_symbol=_AUDUSD_SIM.raw_symbol,
+            base_currency=_AUDUSD_SIM.base_currency,
+            quote_currency=_AUDUSD_SIM.quote_currency,
+            price_precision=_AUDUSD_SIM.price_precision,
+            size_precision=_AUDUSD_SIM.size_precision,
+            price_increment=_AUDUSD_SIM.price_increment,
+            size_increment=_AUDUSD_SIM.size_increment,
+            lot_size=_AUDUSD_SIM.lot_size,
+            max_quantity=_AUDUSD_SIM.max_quantity,
+            min_quantity=_AUDUSD_SIM.min_quantity,
+            max_price=_AUDUSD_SIM.max_price,
+            min_price=_AUDUSD_SIM.min_price,
+            max_notional=_AUDUSD_SIM.max_notional,
+            min_notional=_AUDUSD_SIM.min_notional,
+            margin_init=_AUDUSD_SIM.margin_init,
+            margin_maint=_AUDUSD_SIM.margin_maint,
+            maker_fee=_AUDUSD_SIM.maker_fee,
+            taker_fee=_AUDUSD_SIM.taker_fee,
+            tick_scheme_name=_AUDUSD_SIM.tick_scheme_name,
+            ts_event=ts_event,
+            ts_init=ts_init,
+            info=info,
+        )
 
     ################################################################################
     # General
@@ -310,6 +332,76 @@ class TestCachePostgresAdapter:
         assert result.ts_event == 123
         assert result.ts_init == 456
         assert result.min_price == Price.from_str("111")
+
+    @pytest.mark.asyncio
+    async def test_add_instrument_currency_pair_round_trips_info_metadata(self):
+        expected_info = {
+            "source": "ib",
+            "min_tick": "0.00001",
+            "price_magnifier": 1,
+        }
+        instrument = self._make_audusd_with_info(expected_info)
+
+        self.database.add_currency(instrument.base_currency)
+        self.database.add_currency(instrument.quote_currency)
+
+        await eventually(lambda: len(self.database.load_currencies()) >= 2, timeout=_TEST_TIMEOUT)
+
+        self.database.add_instrument(instrument)
+
+        await eventually(
+            lambda: self.database.load_instrument(instrument.id) is not None
+            and self.database.load_instrument(instrument.id).info == expected_info,
+            timeout=_TEST_TIMEOUT,
+        )
+
+        loaded = self.database.load_instrument(instrument.id)
+        loaded_map = self.database.load_instruments()
+
+        assert loaded.info == expected_info
+        assert loaded_map[instrument.id].info == expected_info
+
+    @pytest.mark.asyncio
+    async def test_add_instrument_currency_pair_updates_info_metadata_with_upsert(self):
+        original = self._make_audusd_with_info(
+            {
+                "source": "ib",
+                "trading_class": "AUD.USD",
+            },
+            ts_event=100,
+            ts_init=100,
+        )
+        updated_info = {
+            "source": "ib",
+            "trading_class": "AUD.USD",
+            "contract_month": "SPOT",
+        }
+        updated = self._make_audusd_with_info(updated_info, ts_event=200, ts_init=300)
+
+        self.database.add_currency(original.base_currency)
+        self.database.add_currency(original.quote_currency)
+
+        await eventually(lambda: len(self.database.load_currencies()) >= 2, timeout=_TEST_TIMEOUT)
+
+        self.database.add_instrument(original)
+        await eventually(
+            lambda: self.database.load_instrument(original.id) is not None
+            and self.database.load_instrument(original.id).info == original.info,
+            timeout=_TEST_TIMEOUT,
+        )
+
+        self.database.add_instrument(updated)
+        await eventually(
+            lambda: self.database.load_instrument(updated.id) is not None
+            and self.database.load_instrument(updated.id).info == updated_info
+            and self.database.load_instrument(updated.id).ts_event == 200,
+            timeout=_TEST_TIMEOUT,
+        )
+
+        loaded = self.database.load_instrument(updated.id)
+        assert loaded.info == updated_info
+        assert loaded.ts_event == 200
+        assert loaded.ts_init == 300
 
     ################################################################################
     # Instrument - Equity
