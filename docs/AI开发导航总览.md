@@ -12,7 +12,7 @@
 
 1. 当前仓库做什么
 2. 当前有哪些正式文档入口
-3. change 应该写到 `../nautilus_demo/docs/changes/`
+3. change 应该写到 `../nautilus_strategies/docs/changes/`
 4. `Doc Harness Kit` 在当前仓库如何落地
 
 ---
@@ -32,9 +32,9 @@
 | 看 `pdk0007` 新增入口逐项解读 | `docs/developer_guide/pdk0007新增入口逐项解读.md` |
 | 看 `pdk0007` 与 `Carlos` 重叠入口对比 | `docs/developer_guide/pdk0007与Carlos重叠入口对比.md` |
 | 看 `Carlos` 独有入口逐项解读 | `docs/developer_guide/Carlos独有入口逐项解读.md` |
-| 看当前 change 主题样例 | `../../nautilus_demo/docs/changes/nautilus-postgres-instrument-persistence/` |
+| 看当前 change 主题样例 | `../../nautilus_strategies/docs/changes/nautilus-postgres-instrument-persistence/` |
 | 看 Doc Harness Kit 入口 | `docs/doc_harness_kit/README.md` |
-| 看当前 harness 接入试点 | `../../nautilus_demo/docs/changes/20260327__harness-adoption__minimal-5step-adoption/` |
+| 看当前 harness 接入试点 | `../../nautilus_strategies/docs/changes/20260327__harness-adoption__minimal-5step-adoption/` |
 
 ---
 
@@ -42,10 +42,10 @@
 
 1. `docs/developer_guide/index.md`
    - 官方开发者入口
-2. `../../nautilus_demo/docs/changes/README.md`
-   - `nautilus_demo` 当前 change 的最小使用说明
-3. `../../nautilus_demo/docs/changes/_template/`
-   - `nautilus_demo` 当前 change 三件套模板
+2. `../../nautilus_strategies/docs/changes/README.md`
+   - `nautilus_strategies` 当前 change 的最小使用说明
+3. `../../nautilus_strategies/docs/changes/_template/`
+   - `nautilus_strategies` 当前 change 三件套模板
 4. `docs/doc_harness_kit/README.md`
    - 跨项目复用的文档闭环执行套件入口
 
@@ -53,11 +53,11 @@
 
 ## 当前治理状态
 
-当前仓库当前只用于学习 Nautilus 源码；change 与验收闭环统一迁到 `../nautilus_demo/docs/changes/`。
+当前仓库当前只用于学习 Nautilus 源码；change 与验收闭环统一迁到 `../nautilus_strategies/docs/changes/`。
 
 本轮开始补齐：
 
 1. `AGENTS.md`（声明本仓只读学习边界）
-2. `../../nautilus_demo/docs/changes/_template/`
+2. `../../nautilus_strategies/docs/changes/_template/`
 3. `docs/doc_harness_kit/`
-4. `../../nautilus_demo/docs/changes/20260327__harness-adoption__minimal-5step-adoption/`
+4. `../../nautilus_strategies/docs/changes/20260327__harness-adoption__minimal-5step-adoption/`

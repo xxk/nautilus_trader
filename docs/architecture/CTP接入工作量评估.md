@@ -224,7 +224,7 @@ Nautilus 当前是跨平台仓库，而 CTP SDK 交付通常带明显平台约�
 
 ## 决策建议
 
-如果当前目标是 `nautilus_demo` 先跑研究、回测和单机场景，不建议现在就做完整 CTP provider。
+如果当前目标是 `nautilus_strategies` 先跑研究、回测和单机场景，不建议现在就做完整 CTP provider。
 
 更合理的路线是：
 

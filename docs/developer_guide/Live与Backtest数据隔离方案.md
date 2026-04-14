@@ -43,7 +43,7 @@
 
 1. `nautilus_live`
 2. `nautilus_backtest`
-3. `nautilus_demo`
+3. `nautilus_strategies`
 4. `nautilus_acceptance`
 
 ### 优点
@@ -161,7 +161,7 @@ backtest_cache = CacheConfig(
 
 1. 真实运行环境：`nautilus_live`
 2. 回测环境：`nautilus_backtest`
-3. 演示或试验：`nautilus_demo`
+3. 演示或试验：`nautilus_strategies`
 4. AI / acceptance 留证：`nautilus_acceptance`
 
 ---
